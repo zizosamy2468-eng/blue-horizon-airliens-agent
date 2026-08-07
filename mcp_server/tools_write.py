@@ -17,12 +17,24 @@
 # request_supervisor_approval(ctx, ...), which pauses the tool call and asks
 # a human on the client side to approve or decline. See elicitation_logic.py.
 #
+# MEMORY INTEGRATION (added for the Memory & RAG lab): every return path --
+# rejections included, not just approvals -- now calls record_turn() so the
+# promote-or-drop router sees the full picture of what was attempted during
+# a session, not just what succeeded. A rejected duplicate-compensation
+# attempt is exactly the kind of thing worth remembering.
+#
+# One small necessary schema addition: rebook_passenger's SELECT now also
+# pulls f.flight_number (it wasn't selected before), because a session_id
+# has to be derived from the flight being handled and the original query
+# didn't expose it. Nothing else about that query changed.
+#
 # The actual @mcp.tool() registration happens in server.py.
 
 from typing import Literal
 from mcp.server.fastmcp import Context
 from dbase import get_connection
 from elicitation_logic import request_supervisor_approval
+from memory_tools import get_session_id, record_turn, resolve_pending_decision, update_scratchpad
 
 MAX_FLYING_HOURS_PER_DAY = 8.00
 MAX_DUTY_HOURS_PER_DAY = 14.00
@@ -44,17 +56,25 @@ async def assign_reserve_crew(
     crew_id: the numeric ID of the crew member being assigned (must be a positive integer)
     requested_by: the ops agent ID making this request, e.g. agent_014 (required for authorization)
     """
+    session_id = get_session_id(flight_number)
+
     if crew_id <= 0:
-        return "Rejected: crew_id must be a positive integer."
+        msg = "Rejected: crew_id must be a positive integer."
+        record_turn(session_id, "tool_result", msg)
+        return msg
 
     if not requested_by or not requested_by.strip():
-        return "Rejected: requested_by is required so this action is attributable to an ops agent."
+        msg = "Rejected: requested_by is required so this action is attributable to an ops agent."
+        record_turn(session_id, "tool_result", msg)
+        return msg
 
     if not requested_by.startswith("agent_"):
-        return (
+        msg = (
             f"Rejected: '{requested_by}' is not recognized as a valid ops agent ID. "
             "Crew assignment requires an authenticated ops agent."
         )
+        record_turn(session_id, "tool_result", msg)
+        return msg
 
     conn = get_connection()
     cursor = conn.cursor(dictionary=True)
@@ -66,13 +86,17 @@ async def assign_reserve_crew(
         )
         flight = cursor.fetchone()
         if flight is None:
-            return f"Rejected: no flight found with number {flight_number}."
+            msg = f"Rejected: no flight found with number {flight_number}."
+            record_turn(session_id, "tool_result", msg)
+            return msg
 
         if flight["status"] not in ("disrupted", "delayed", "cancelled"):
-            return (
+            msg = (
                 f"Rejected: flight {flight_number} has status '{flight['status']}'. "
                 "Reserve crew assignment is only allowed for disrupted, delayed, or cancelled flights."
             )
+            record_turn(session_id, "tool_result", msg)
+            return msg
 
         cursor.execute(
             "SELECT crew_id, full_name, role FROM crew WHERE crew_id = %s",
@@ -80,7 +104,9 @@ async def assign_reserve_crew(
         )
         crew_member = cursor.fetchone()
         if crew_member is None:
-            return f"Rejected: no crew member found with ID {crew_id}."
+            msg = f"Rejected: no crew member found with ID {crew_id}."
+            record_turn(session_id, "tool_result", msg)
+            return msg
 
         cursor.execute(
             """
@@ -97,6 +123,17 @@ async def assign_reserve_crew(
 
         override_note = ""
         if total_duty >= MAX_DUTY_HOURS_PER_DAY or total_flown >= MAX_FLYING_HOURS_PER_DAY:
+            # Scratchpad update: this is the exact moment a real sub-goal
+            # starts -- the agent can't complete the assignment until this
+            # specific decision comes back. pending_decisions survives even
+            # if the buffer gets pruned while waiting on the supervisor.
+            decision_text = f"awaiting duty-hour override decision for crew_id={crew_id} on {flight_number}"
+            update_scratchpad(
+                session_id=session_id,
+                sub_goal=f"assign crew_id={crew_id} to {flight_number} pending duty-hour override",
+                pending_decisions=decision_text,
+            )
+
             # This is the real trigger for elicitation: the tool cannot safely decide this
             # on its own, so it pauses and asks a supervisor instead of guessing or refusing.
             approved, info = await request_supervisor_approval(
@@ -108,9 +145,22 @@ async def assign_reserve_crew(
                     "would exceed the legal limit. Do you approve this assignment anyway?"
                 ),
             )
+            resolve_pending_decision(session_id, decision_text)
+
             if not approved:
-                return f"Rejected: {info}"
+                msg = f"Rejected: {info}"
+                record_turn(session_id, "tool_result", msg)
+                return msg
             override_note = f" (Supervisor override: {info})"
+            # This is exactly the kind of turn the promote-or-drop router
+            # should keep: an authorization_event + operational_decision
+            # signal together (see memory/router.py's SIGNAL_WEIGHTS).
+            record_turn(
+                session_id,
+                "tool_result",
+                f"SUPERVISOR APPROVAL NEEDED: {crew_member['full_name']} (crew_id={crew_id}) "
+                f"already at {total_duty} duty hours today.{override_note}",
+            )
 
         cursor.execute(
             """
@@ -121,10 +171,12 @@ async def assign_reserve_crew(
         )
         conn.commit()
 
-        return (
+        result = (
             f"Approved: {crew_member['full_name']} ({crew_member['role']}) assigned as reserve "
             f"crew on flight {flight_number}. Requested by {requested_by}.{override_note}"
         )
+        record_turn(session_id, "tool_result", result)
+        return result
 
     finally:
         cursor.close()
@@ -152,17 +204,25 @@ async def issue_compensation(
     reason: a short explanation for the compensation, e.g. "flight cancelled due to weather"
     issued_by: the ops agent ID issuing this compensation (required for authorization)
     """
+    session_id = get_session_id(flight_number)
+
     if amount <= 0:
-        return "Rejected: compensation amount must be a positive number."
+        msg = "Rejected: compensation amount must be a positive number."
+        record_turn(session_id, "tool_result", msg)
+        return msg
 
     if not reason or not reason.strip():
-        return "Rejected: a reason is required for every compensation payout."
+        msg = "Rejected: a reason is required for every compensation payout."
+        record_turn(session_id, "tool_result", msg)
+        return msg
 
     if not issued_by or not issued_by.strip() or not issued_by.startswith("agent_"):
-        return (
+        msg = (
             "Rejected: compensation must be issued by an authenticated ops agent "
             "(expected an ID like agent_007)."
         )
+        record_turn(session_id, "tool_result", msg)
+        return msg
 
     conn = get_connection()
     cursor = conn.cursor(dictionary=True)
@@ -174,7 +234,9 @@ async def issue_compensation(
         )
         passenger = cursor.fetchone()
         if passenger is None:
-            return f"Rejected: no passenger found with email {passenger_email}."
+            msg = f"Rejected: no passenger found with email {passenger_email}."
+            record_turn(session_id, "tool_result", msg)
+            return msg
 
         cursor.execute(
             "SELECT flight_id, status FROM flights WHERE flight_number = %s",
@@ -182,13 +244,17 @@ async def issue_compensation(
         )
         flight = cursor.fetchone()
         if flight is None:
-            return f"Rejected: no flight found with number {flight_number}."
+            msg = f"Rejected: no flight found with number {flight_number}."
+            record_turn(session_id, "tool_result", msg)
+            return msg
 
         if flight["status"] not in ("disrupted", "delayed", "cancelled"):
-            return (
+            msg = (
                 f"Rejected: flight {flight_number} has status '{flight['status']}'. "
                 "Compensation can only be issued for disrupted, delayed, or cancelled flights."
             )
+            record_turn(session_id, "tool_result", msg)
+            return msg
 
         cursor.execute(
             """
@@ -200,14 +266,23 @@ async def issue_compensation(
         )
         existing = cursor.fetchone()
         if existing is not None:
-            return (
+            msg = (
                 f"Rejected: passenger {passenger['full_name']} already has a "
                 f"{existing['status']} compensation of {existing['amount']} for this flight. "
                 "Duplicate compensation is not allowed."
             )
+            record_turn(session_id, "tool_result", msg)
+            return msg
 
         override_note = ""
         if amount > MAX_COMPENSATION_WITHOUT_APPROVAL:
+            decision_text = f"awaiting compensation approval ({amount} {currency}) for {passenger['full_name']} on {flight_number}"
+            update_scratchpad(
+                session_id=session_id,
+                sub_goal=f"issue {amount} {currency} compensation pending supervisor approval",
+                pending_decisions=decision_text,
+            )
+
             # This is the real trigger for elicitation: the tool cannot decide on its own
             # whether a large payout is justified, so it pauses and asks a supervisor.
             approved, info = await request_supervisor_approval(
@@ -218,8 +293,12 @@ async def issue_compensation(
                     f"auto-approve limit. Reason given: {reason}. Do you approve this payout?"
                 ),
             )
+            resolve_pending_decision(session_id, decision_text)
+
             if not approved:
-                return f"Rejected: {info}"
+                msg = f"Rejected: {info}"
+                record_turn(session_id, "tool_result", msg)
+                return msg
             override_note = f" (Supervisor override: {info})"
 
         cursor.execute(
@@ -231,10 +310,12 @@ async def issue_compensation(
         )
         conn.commit()
 
-        return (
+        result = (
             f"Approved: {amount} {currency} compensation issued to {passenger['full_name']} "
             f"for flight {flight_number}. Reason: {reason}. Issued by {issued_by}.{override_note}"
         )
+        record_turn(session_id, "tool_result", result)
+        return result
 
     finally:
         cursor.close()
@@ -263,10 +344,14 @@ def rebook_passenger(
     cursor = conn.cursor(dictionary=True)
 
     try:
+        # NOTE: f.flight_number added to this SELECT (it wasn't there
+        # originally) -- needed to derive the session_id for the OLD
+        # (disrupted) flight this rebooking belongs to. Nothing else about
+        # this query changed.
         cursor.execute(
             """
             SELECT b.booking_id, b.passenger_id, b.flight_id, b.booking_status, b.fare_class,
-                   f.status AS old_flight_status, p.full_name
+                   f.status AS old_flight_status, f.flight_number AS old_flight_number, p.full_name
             FROM bookings b
             JOIN flights f ON b.flight_id = f.flight_id
             JOIN passengers p ON b.passenger_id = p.passenger_id
@@ -278,15 +363,21 @@ def rebook_passenger(
         if old_booking is None:
             return f"Rejected: no booking found with ID {booking_id}."
 
+        session_id = get_session_id(old_booking["old_flight_number"])
+
         if old_booking["old_flight_status"] not in ("disrupted", "delayed", "cancelled"):
-            return (
+            msg = (
                 f"Rejected: booking {booking_id} is on a flight with status "
                 f"'{old_booking['old_flight_status']}'. Rebooking is only allowed when the "
                 "original flight is disrupted, delayed, or cancelled."
             )
+            record_turn(session_id, "tool_result", msg)
+            return msg
 
         if old_booking["booking_status"] == "rebooked":
-            return f"Rejected: booking {booking_id} has already been rebooked."
+            msg = f"Rejected: booking {booking_id} has already been rebooked."
+            record_turn(session_id, "tool_result", msg)
+            return msg
 
         cursor.execute(
             "SELECT flight_id, status FROM flights WHERE flight_number = %s",
@@ -294,13 +385,17 @@ def rebook_passenger(
         )
         new_flight = cursor.fetchone()
         if new_flight is None:
-            return f"Rejected: no flight found with number {new_flight_number}."
+            msg = f"Rejected: no flight found with number {new_flight_number}."
+            record_turn(session_id, "tool_result", msg)
+            return msg
 
         if new_flight["status"] not in ("scheduled", "delayed"):
-            return (
+            msg = (
                 f"Rejected: cannot rebook onto flight {new_flight_number} because its status "
                 f"is '{new_flight['status']}'."
             )
+            record_turn(session_id, "tool_result", msg)
+            return msg
 
         cursor.execute(
             """
@@ -310,10 +405,12 @@ def rebook_passenger(
             (old_booking["passenger_id"], new_flight["flight_id"]),
         )
         if cursor.fetchone() is not None:
-            return (
+            msg = (
                 f"Rejected: {old_booking['full_name']} is already booked on flight "
                 f"{new_flight_number}. Double-booking is not allowed."
             )
+            record_turn(session_id, "tool_result", msg)
+            return msg
 
         cursor.execute(
             "UPDATE bookings SET booking_status = 'rebooked' WHERE booking_id = %s",
@@ -328,10 +425,12 @@ def rebook_passenger(
         )
         conn.commit()
 
-        return (
+        result = (
             f"Approved: {old_booking['full_name']} rebooked from booking {booking_id} "
             f"onto flight {new_flight_number}. Requested by {requested_by}."
         )
+        record_turn(session_id, "tool_result", result)
+        return result
 
     finally:
         cursor.close()
