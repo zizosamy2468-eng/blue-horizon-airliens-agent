@@ -1,0 +1,30 @@
+{
+  "sliding_window": {
+    "accuracy": "0/10",
+    "accuracy_pct": 0.0,
+    "avg_input_tokens": 533.9,
+    "avg_output_tokens": 24.3,
+    "avg_latency_ms": 1211.65
+  },
+  "observation_masking": {
+    "accuracy": "10/10",
+    "accuracy_pct": 100.0,
+    "avg_input_tokens": 1245.9,
+    "avg_output_tokens": 53,
+    "avg_latency_ms": 793.81
+  },
+  "recursive_summarization": {
+    "accuracy": "8/10",
+    "accuracy_pct": 80.0,
+    "avg_input_tokens": 770.1,
+    "avg_output_tokens": 215.7,
+    "avg_latency_ms": 11972.84
+  },
+  "zone_based_pruning": {
+    "accuracy": "10/10",
+    "accuracy_pct": 100.0,
+    "avg_input_tokens": 1553.5,
+    "avg_output_tokens": 54.6,
+    "avg_latency_ms": 895.52
+  }
+}
