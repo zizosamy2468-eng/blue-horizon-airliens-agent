@@ -1,5 +1,29 @@
-mcp
-mysql-connector-python
-python-dotenv
-pydantic
-rank-bm25
+# Blue Horizon IROPS Assistant — full project dependencies
+# (existing MCP server layer + memory/ + context_eval/ + rag/ + retrieval_eval/)
+
+# --- MCP protocol (server + clients) ---
+mcp>=1.2.0
+
+# --- Database layer (db/, tools_read.py, tools_write.py, dbase.py) ---
+mysql-connector-python>=8.4.0
+
+# --- Config / secrets loading (used throughout: dbase.py, embeddings.py,
+#     llm_client.py, naive_rag.py, hybrid_rag.py, agentic_rag.py, self_rag.py) ---
+python-dotenv>=1.0.1
+
+# --- LLM + embeddings (context_eval/llm_client.py, rag/embeddings.py,
+#     rag/naive_rag.py, rag/hybrid_rag.py, rag/agentic_rag.py, rag/self_rag.py) ---
+google-genai>=1.2.0
+
+# --- Vector database (rag/vector_store.py) ---
+chromadb>=0.5.0
+
+# --- Keyword / BM25 search (mcp_server/keyword_search.py, rag/hybrid_rag.py,
+#     rag/agentic_rag.py, retrieval_eval/run_eval.py) ---
+rank_bm25>=0.2.2
+
+# --- Structured tool schemas (mcp_server/tools_search.py) ---
+pydantic>=2.7.0
+
+# --- Numeric sanity checks (rag/embeddings.py similarity check) ---
+numpy>=1.26.0
