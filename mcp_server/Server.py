@@ -15,6 +15,17 @@
 #     run this as a shared network service for many ops agents at once, not
 #     as a single local subprocess per agent. `python server.py stdio` is
 #     kept as a fallback for quick local debugging with the MCP Inspector.
+#   - MEMORY & RAG (added for the Memory & RAG lab): memory_tools.py wires
+#     the memory system (memory/) and hybrid RAG with Self-RAG verification
+#     (rag/) into this same server. recall_flight_history and
+#     search_policy_manual are available to everyone from the start, same
+#     as the other read-only tools -- they don't change state.
+#     run_memory_consolidation is supervisor-only, registered the same way
+#     assign_reserve_crew and issue_compensation are: it doesn't exist for
+#     a session until authenticate_supervisor succeeds, because triggering
+#     a consolidation pass changes what the whole system treats as current
+#     truth going forward, not something a front-desk session should do
+#     implicitly.
 
 import sys
 
@@ -27,6 +38,7 @@ from notifications_logic import check_supervisor_credentials, session_state
 from sampling_logic import generate_disruption_notice
 from progress_logic import rebook_all_passengers_on_flight
 from tools_search import search_knowledge_base
+from memory_tools import recall_flight_history, search_policy_manual, run_memory_consolidation
 
 # =========================================================
 # CAPABILITY NEGOTIATION
@@ -48,6 +60,12 @@ mcp.tool()(rebook_passenger)
 mcp.tool()(rebook_all_passengers_on_flight)
 mcp.tool()(generate_disruption_notice)
 mcp.tool()(search_knowledge_base)
+# --- Memory & RAG lab additions ---
+# Both read-only (recall_flight_history reads episodic memory,
+# search_policy_manual reads the policy manual vector store), so they're
+# available from the start like every other read-only tool above.
+mcp.tool()(recall_flight_history)
+mcp.tool()(search_policy_manual)
 
 
 # =========================================================
@@ -76,9 +94,13 @@ async def authenticate_supervisor(
     if session_state["supervisor_authenticated"]:
         return f"Supervisor {supervisor_id} is already authenticated. No change made."
 
-    # Register the two supervisor-only tools now that we know who this is.
+    # Register the supervisor-only tools now that we know who this is.
     mcp.add_tool(assign_reserve_crew)
     mcp.add_tool(issue_compensation)
+    # Memory & RAG lab addition: consolidation is supervisor-gated for the
+    # same reason the two tools above are -- it changes shared state
+    # (semantic memory) that every future session relies on.
+    mcp.add_tool(run_memory_consolidation)
 
     session_state["supervisor_authenticated"] = True
     session_state["supervisor_id"] = supervisor_id
@@ -90,7 +112,8 @@ async def authenticate_supervisor(
 
     return (
         f"Supervisor {supervisor_id} authenticated. "
-        "assign_reserve_crew and issue_compensation are now available."
+        "assign_reserve_crew, issue_compensation, and run_memory_consolidation "
+        "are now available."
     )
 
 
@@ -101,7 +124,10 @@ async def authenticate_supervisor(
 def duty_time_policy() -> str:
     """
     Crew duty-time limit policy (simplified version for this project,
-    not the full official regulation).
+    not the full official regulation). For the full policy manual --
+    compensation rules, overrides, rebooking priority, exceptions -- see
+    the search_policy_manual tool instead, which retrieves from the real
+    IROPS Policy Manual (rag/policy_corpus.py) rather than this fixed text.
     """
     return (
         "Crew duty-time limit policy (simplified for this project):\n"
