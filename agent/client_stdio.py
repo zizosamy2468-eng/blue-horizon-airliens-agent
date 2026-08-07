@@ -133,7 +133,52 @@ async def main():
 
             print(result.content[0].text)
             print()
+            print("=== Testing search_knowledge_base (weather) ===")
 
+            result = await session.call_tool(
+                "search_knowledge_base",
+                arguments={
+                    "query": "weather",
+                    "entity_id": "BH303",
+                    "top_k": 3
+                }
+            )
+
+            print(result.content[0].text)
+            print()
+
+            # =========================================================
+            # Memory & RAG lab — new tools
+            # =========================================================
+
+            print("=== Testing search_policy_manual ===")
+            result = await session.call_tool(
+                "search_policy_manual",
+                arguments={
+                    "query": "compensation cap for mechanical disruptions"
+                }
+            )
+            print(result.content[0].text)
+            print()
+
+            print("=== Testing recall_flight_history ===")
+            result = await session.call_tool(
+                "recall_flight_history",
+                arguments={
+                    "flight_number": "BH202",
+                    "current_question": "any duty-hour overrides on record?"
+                }
+            )
+            print(result.content[0].text)
+            print()
+
+            print("=== Testing run_memory_consolidation (supervisor-only) ===")
+            result = await session.call_tool(
+                "run_memory_consolidation",
+                arguments={}
+            )
+            print(result.content[0].text)
+            print()
 
 if __name__ == "__main__":
     asyncio.run(main())
