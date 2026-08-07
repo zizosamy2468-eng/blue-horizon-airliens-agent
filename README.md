@@ -1,217 +1,336 @@
-# Blue Horizon Airlines — IROPS Assistant (MCP Server)
+# Blue Horizon IROPS Assistant — Memory & RAG Extension
 
-## 1. The Company & the Problem
+This extends the existing Blue Horizon MCP Server Lab project (`mcp_server/`, `db/`)
+with a real long-term memory system and a real retrieval layer. Nothing in the
+original server, database, or tool set was rebuilt — this is growth on top of it.
 
-Blue Horizon Airlines is a mid-size international carrier (Cairo hub, routes into
-Europe) that, like every airline, deals with **IROPS — Irregular Operations**:
-mechanical delays, weather cancellations, crew shortages. When a flight goes
-disrupted, front-desk ops agents have to, in minutes, check the flight, look up
-every affected passenger, rebook them, assign reserve crew, issue compensation,
-and get a passenger notice out — today all done by hand across multiple screens.
+## 1. The problem we found
 
-The naive fix is "just give the LLM a database connection and let it write
-SQL." That's the failure mode we designed around: an agent (human or model)
-could push a passenger onto an already-cancelled flight, assign a pilot past
-their legal duty-time limit, or approve an unbounded compensation payout —
-each of those has real regulatory and financial consequences, not just a bad
-UX. So instead of raw DB access, the LLM only ever talks to an **MCP server**
-that sits in front of the database and enforces the business rules itself,
-independent of whatever the model decides to send.
+Blue Horizon's IROPS (Irregular Operations) ops agents handle flight disruptions
+through the existing MCP server: checking flight status, assigning reserve crew,
+issuing compensation, rebooking passengers. Two real gaps showed up once we looked
+at how this would actually run day to day:
 
-**Two tools in particular carry real risk and are why this project needs the
-full set of protocol concerns, not just "call a tool, get an answer":**
-- `assign_reserve_crew` — a duty-time violation is a legal/safety issue, not a
-  UX inconvenience.
-- `issue_compensation` — money leaving the company above a threshold shouldn't
-  be approved by an unsupervised agent (or a hallucinating model).
+**Gap 1 — no memory across sessions.** Every IROPS session starts from zero. If a
+supervisor approves a duty-hour override for a crew member at 9am, and a different
+ops agent picks up the same flight's disruption at 2pm, the system has no way to
+tell them that override already happened, or that the disruption cause was later
+reclassified from "mechanical" to "weather" by maintenance. Front-desk agents would
+re-ask and re-approve things that already have an answer. This has a real cost:
+duplicate compensation, or a crew member's duty-hour override getting requested
+twice for the same day when the first one already covers the situation.
 
-## 2. Database / ERD
+**Gap 2 — no grounding in policy.** The original `search_knowledge_base` tool was
+four hardcoded sentences. Real IROPS decisions depend on an actual policy manual —
+compensation eligibility, duty-time override rules, rebooking priority, loyalty-tier
+multipliers — with real cross-references between sections (a compensation rule that
+only applies if a duty-time override also happened, IROPS-COMP-5 vs IROPS-DUTY-3).
+Nobody wants to turn 18 policy sections into 18 more MCP tools, and an agent
+guessing at policy instead of retrieving it is exactly the kind of hallucination
+that costs real money or breaks a real safety rule.
 
-SQLite/MySQL-style relational schema (see `db/` for schema + seed data + ERD
-image/Mermaid source). Core entities:
+Both gaps needed the full architecture the lab asks for — a partial version
+(memory with no consolidation, or RAG with no verification) wouldn't have actually
+fixed either problem.
 
-```mermaid
-erDiagram
-    PASSENGERS ||--o{ BOOKINGS : makes
-    FLIGHTS ||--o{ BOOKINGS : has
-    FLIGHTS ||--o{ CREW_ASSIGNMENTS : has
-    CREW ||--o{ CREW_ASSIGNMENTS : assigned_to
-    CREW ||--o{ DUTY_TIME_LOGS : logs
-    PASSENGERS ||--o{ COMPENSATION : receives
-    FLIGHTS ||--o{ COMPENSATION : relates_to
+## 2. Extending the existing system
 
-    PASSENGERS {
-        int passenger_id PK
-        string full_name
-        string email UK
-        enum loyalty_tier "none, silver, gold, platinum"
-        timestamp created_at
+`mcp_server/tools_read.py` and `mcp_server/tools_write.py` keep their original SQL
+and business logic untouched. The only addition is a `record_turn()` /
+`update_scratchpad()` call before each return, wired through the new
+`mcp_server/memory_tools.py`. `server.py` registers three new tools
+(`recall_flight_history`, `search_policy_manual`, `run_memory_consolidation`)
+using the exact same `mcp.tool()` / `mcp.add_tool()` pattern already used for every
+other tool in the file. The old `search_knowledge_base` tool is left in place for
+comparison but is superseded by `search_policy_manual`.
+
+## 3. Repository structure
+
+```
+memory/
+  short_term.py       rolling buffer + scratchpad
+  router.py            promote-or-drop routing (forget / episodic only)
+  episodic.py           episodic store (session-scoped, persisted to JSON)
+  semantic.py            semantic store (versioned, conflict-aware)
+  consolidation.py         the only writer to semantic.py, runs periodically
+
+context_eval/
+  llm_client.py        real Gemini calls for summarization + answering
+  test_suite.py         40-turn long-context test transcripts, 10 variations
+  strategies.py           all four context management strategies
+  run_eval.py                comparison table + strategy selection
+
+rag/
+  policy_corpus.py     the 18-section IROPS policy manual (the RAG corpus)
+  embeddings.py          Gemini embedding pipeline
+  vector_store.py          Chroma vector DB (HNSW + metadata filtering)
+  naive_rag.py                architecture 1/3
+  hybrid_rag.py                 architecture 2/3 (vector + BM25)
+  agentic_rag.py                  architecture 3/3 (multi-hop function calling)
+  self_rag.py                       relevance + support verification, both RAG and memory recall
+
+retrieval_eval/
+  test_questions.py    12 domain questions across general/citation/multi_part
+  run_eval.py             comparison table + architecture selection
+
+mcp_server/
+  memory_tools.py       the only new file wiring memory/ and rag/ into the live server
+  tools_read.py, tools_write.py, server.py    unchanged logic, memory hooks added
+client/
+  client_stdio.py, client_http.py    updated to exercise the new tools
+```
+
+## 4. Memory architecture
+
+**Short-term memory + scratchpad** (`memory/short_term.py`): a token-bounded
+rolling buffer of turns, and a separate flat scratchpad (`current_flight`,
+`current_goal`, `sub_goal`, `working_facts`, `pending_decisions`) that is never
+touched by buffer pruning. Verified directly — after the buffer was fully drained
+to 0 turns, the scratchpad still held the full working state:
+
+```
+Final snapshot:
+{'session_id': 'BH202-2026-08-02', 'buffer_turns': 0, 'buffer_tokens': 0,
+ 'scratchpad': {'current_flight': 'BH202', 'current_goal': 'resolve disruption for BH202',
+ 'sub_goal': 'check crew duty hours before assigning reserve crew',
+ 'working_facts': {'disruption_reason': 'mechanical'},
+ 'pending_decisions': ['awaiting supervisor approval for crew_id=1 duty override']}}
+```
+
+**Promote-or-drop routing** (`memory/router.py`): fires when the buffer overflows.
+A transparent, rule-based scorer (financial / operational / authorization /
+root-cause signal keywords) decides forget vs. episodic per turn, with the full
+reasoning logged. It never writes to semantic memory. In one drain of 5 turns, 2
+were promoted (a disruption status with a root-cause fact, and a supervisor
+override) and 3 were dropped as routine noise — and the scratchpad was untouched
+by any of it.
+
+**Episodic memory** (`memory/episodic.py`): promoted turns persisted to disk with
+extracted flight numbers, amounts, and supervisor IDs, so a session tomorrow can
+pull up today's history without re-asking:
+
+```
+--- Simulating tomorrow: a NEW session pulls up BH202's history ---
+Found 1 past episodes about BH202 without re-asking anything:
+  - Flight BH202: CAI to LHR - Status: disrupted - Reason: mechanical
+```
+
+**Semantic memory consolidation** (`memory/consolidation.py`, the only writer to
+`memory/semantic.py`): a separate periodic pass over episodic memory — never
+triggered inline by the router. It extracts (subject, predicate, value) facts,
+scores authority by source (supervisor-involved > confirmed > unconfirmed), and
+resolves conflicts explicitly rather than silently overwriting. Real conflict
+resolved by a live consolidation run — an initial unconfirmed "mechanical" report
+for BH202 vs. a later maintenance-confirmed "weather" report:
+
+```
+=== Consolidation run summary ===
+ - NEW BH202.disruption_reason = mechanical
+ - CONFLICT BH202.disruption_reason: 'mechanical' (auth=1) vs 'weather' (auth=2) -> kept 'weather'
+ - NEW policy:compensation_cap.auto_approve_cap_usd = 750
+
+new_facts=2 updates=0 conflicts_resolved=1
+```
+
+The losing version (`mechanical`, authority 1) is not deleted — it's retained with
+`status=superseded_due_to_conflict` and a `conflict_notes` field explaining exactly
+what it lost to. A separate, non-conflicting case (the compensation cap rising from
+500 to 750 USD) is handled as a routine update instead, since it isn't two
+sources disagreeing about the same fact, just a policy value changing over time.
+
+## 5. Context window management — all four strategies
+
+Test suite: 10 seeded 40-turn transcripts, each burying one critical fact (a
+supervisor's duty-hour override for a specific crew member) under ~36 turns of
+realistic tool-call noise, including near-duplicate but non-critical override
+mentions for other crew members. Each strategy's pruned output is fed to a real
+Gemini call, and a run only counts as correct if the model's actual answer
+contains the required markers.
+
+| Strategy | Accuracy | Avg input tokens | Avg output tokens | Avg latency |
+|---|---|---|---|---|
+| Sliding window (last 10 turns) | 0/10 | 534 | 24 | 1.21s |
+| Observation masking | 10/10 | 1246 | 53 | 0.79s |
+| Recursive summarization | 8/10 | 770 | 216 | 11.97s |
+| Zone-based pruning | 10/10 | 1554 | 55 | 0.90s |
+
+**Chosen: Observation masking.** Sliding window failed outright — the critical
+fact sits early in the transcript and falls straight out of a fixed 10-turn
+window, which is exactly the real failure mode for a tool-heavy IROPS session.
+Recursive summarization preserved the fact in 8/10 runs but at nearly 15× the
+latency of observation masking, because it makes real per-chunk LLM calls to
+compress older turns. Zone-based pruning tied observation masking at 10/10, but
+cost more input tokens (1554 vs. 1246) and higher latency (0.90s vs. 0.79s) for
+no accuracy benefit given this transcript shape — Blue Horizon's IROPS sessions
+are bloated by tool-call JSON, not dialogue, which observation masking targets
+directly by keeping any significance-flagged tool output regardless of age.
+
+## 6. Vector database architecture
+
+`rag/vector_store.py` uses Chroma with an HNSW index built automatically per
+collection, chunk metadata (category, title, last_reviewed) stored alongside each
+vector, and a `where=` metadata filter applied *before* the similarity search, not
+after. Verified directly — filtering to `category='duty_time'` on a query that
+literally mentions "compensation" still returns only duty-time sections:
+
+```
+=== Filtered search (category='duty_time'): 'compensation cap amount' ===
+(query mentions compensation, but the where= filter forces duty_time-only candidates)
+  0.511  [IROPS-DUTY-3] Supervisor override for duty-time limits during IROPS
+  0.502  [IROPS-DUTY-1] Standard duty-time limits
+  0.490  [IROPS-DUTY-5] Duty-time override does not apply retroactively
+```
+
+## 7. Retrieval architectures — three required
+
+Test suite: 12 questions across three categories (general, citation-heavy,
+multi-part/decomposition), 4 per category, evaluated through the **verified**
+entry points in `rag/self_rag.py` so the table reflects what the live agent would
+actually hand back — including any answer replaced or refused by the Self-RAG
+check.
+
+| Architecture | Accuracy | Avg tokens/query | Avg latency/query | By category |
+|---|---|---|---|---|
+| Naive RAG | 11/12 | 474.5 | 1.69s | general=4/4, citation=4/4, multi_part=3/4 |
+| Hybrid search | 11/12 | 476.2 | 1.89s | general=4/4, citation=4/4, multi_part=3/4 |
+| Agentic RAG | 12/12 | 1120.8 | 3.06s | general=4/4, citation=4/4, multi_part=4/4 |
+
+**Justification (based on the actual numbers above):**
+- Naive RAG and hybrid search both scored 11/12 overall, with identical
+  per-category results (general=4/4, citation=4/4, multi_part=3/4).
+- Agentic RAG was the only architecture to get every multi-part question right
+  (4/4) and finished at 12/12 overall, but at roughly 3.06s and 1121 tokens per
+  query — about 1.6× the latency and 2.3× the tokens of hybrid search.
+- In this particular test run, the citation-heavy questions happened to be
+  retrievable by pure vector search as well, so hybrid did not show a clear
+  accuracy edge over naive here. Hybrid is still preferred over naive as the
+  **default**, because it is structurally robust to exact policy-code lookups
+  (the failure mode hybrid search was specifically built for — an embedding
+  model doesn't treat "4.2b" as a meaningful token, BM25 does) at almost no
+  extra token or latency cost, and a larger or differently-worded citation set
+  could easily expose the gap this run didn't happen to surface.
+- Blue Horizon's live IROPS call volume is dominated by quick general and
+  citation questions during active disruptions, where an ops agent on the
+  phone cannot wait several seconds for a multi-hop reasoning loop. **Hybrid
+  search ships as the default retrieval path**, and multi-part /
+  decomposition-shaped questions (detectable from question length and the
+  presence of multiple distinct entities/conditions) are routed to the
+  **agentic path** instead.
+
+A concrete example of the agentic path earning its cost — a genuinely
+decomposition-shaped question resolved in 2 hops, pulling from 5 different
+policy sections across compensation, mechanical-cause, and duty-time categories
+that a single-shot retrieval on the whole question would not have surfaced
+together:
+
+```
+Q: A gold-tier passenger is on flight BH202, which is disrupted for a mechanical
+reason, and the crew member we'd assign as reserve already needs a duty-time
+override. What compensation applies to the passenger, and what has to happen
+before we can assign that crew member?
+
+Hops used: 2
+Retrieved across all hops: ['IROPS-COMP-5', 'IROPS-MECH-1', 'IROPS-COMP-1',
+'IROPS-CREW-1', 'IROPS-DUTY-4', 'IROPS-DUTY-5', 'IROPS-DUTY-1', 'IROPS-DUTY-3']
+tokens=2773 latency=15.977s
+```
+
+## 8. Self-RAG-style verification
+
+`rag/self_rag.py` runs two explicit LLM-judged checks before any answer reaches
+the user — relevance (is each retrieved passage actually relevant?) and support
+(is the generated answer actually backed by what passed relevance?) — and applies
+identically to RAG answers and to episodic/semantic memory recall
+(`recall_flight_history` uses this same check).
+
+A visible consequence when relevance fails, from a mixed-relevance memory recall
+check against the question "what caused BH202's disruption":
+
+```json
+{
+  "verified": true,
+  "checks": [
+    {
+      "item": "disruption_reason: weather",
+      "relevant": true,
+      "reason": "The passage explicitly identifies weather as the cause of the disruption for BH202."
+    },
+    {
+      "item": "auto_approve_cap_usd: 750",
+      "relevant": false,
+      "reason": "The passage provides a financial limit and contains no information regarding the disruption of BH202."
     }
-    FLIGHTS {
-        int flight_id PK
-        string flight_number
-        string origin_airport
-        string destination_airport
-        datetime scheduled_departure
-        datetime scheduled_arrival
-        enum status "scheduled, delayed, cancelled, disrupted"
-        string disruption_reason
-    }
-    BOOKINGS {
-        int booking_id PK
-        int passenger_id FK
-        int flight_id FK
-        string seat_number
-        enum fare_class "economy, premium, business"
-        enum booking_status "confirmed, rebooked, cancelled"
-    }
-    CREW {
-        int crew_id PK
-        string full_name
-        enum role "pilot, co_pilot, flight_attendant"
-        string base_airport
-        string license_type
-    }
-    CREW_ASSIGNMENTS {
-        int assignment_id PK
-        int crew_id FK
-        int flight_id FK
-        datetime duty_start
-        datetime duty_end
-        enum assignment_type "original, reserve"
-    }
-    DUTY_TIME_LOGS {
-        int log_id PK
-        int crew_id FK
-        date log_date
-        decimal hours_flown
-        decimal hours_on_duty
-    }
-    COMPENSATION {
-        int compensation_id PK
-        int passenger_id FK
-        int flight_id FK
-        decimal amount
-        string currency
-        string reason
-        string issued_by
-        enum status "pending, approved, rejected"
-        timestamp created_at
-    }
+  ]
+}
 ```
 
-Seed data covers both normal and edge cases each tool's validation depends on:
-- `BH101` (CAI→JFK) is `scheduled` — a normal, unaffected flight to rebook onto.
-- `BH202` (CAI→LHR) is `disrupted` (mechanical) — the primary IROPS case: a
-  confirmed booking (Mona Khaled, business), an original crew assignment plus
-  a reserve assignment, and an existing `approved` compensation record for
-  Mona Khaled (`150.00 USD`) — used to demonstrate the duplicate-payout
-  rejection in `issue_compensation`.
-- `BH303` (HRG→DXB) is `cancelled` (weather) with its one booking already
-  `cancelled` — an edge case with no confirmed passengers left, used to show
-  `rebook_all_passengers_on_flight` correctly reporting "no confirmed
-  bookings found" instead of erroring.
-- `duty_time_logs` seeds Capt. Karim Mostafa (`crew_id=1`) right at the daily
-  limits so assigning him as reserve crew genuinely triggers the elicitation
-  pause (see `db/seed.sql` — set to `8.00` flying / `14.00` duty hours to hit
-  the `>=` threshold exactly); Capt. Laila Hassan (`crew_id=2`) stays well
-  under both limits as the "no elicitation needed" control case.
+The compensation-cap fact was correctly filtered out — it matched nothing about
+the question asked, even though it lives in the same store. Nothing irrelevant
+was allowed through just because it was recalled successfully.
 
-## 3. How Each Protocol Concern Shows Up
+## 9. Live integration
 
-| Concern | Where it lives | Genuine trigger in our problem |
-|---|---|---|
-| **Capability negotiation** | `server.py` — `FastMCP(...)` declares tools/resources/prompts/elicitation/sampling during `initialize` | Client should not assume every server supports elicitation or sampling; ops agents connecting without a modern client still get the read-only tools safely |
-| **Notifications** | `server.py: authenticate_supervisor` → `notifications_logic.py` | A front-desk session literally cannot see `assign_reserve_crew` / `issue_compensation` until a real supervisor authenticates mid-session — no reconnect, real `tools/list_changed` push |
-| **Elicitation** | `tools_write.py: assign_reserve_crew`, `issue_compensation` → `elicitation_logic.py` | Duty-hour overage or compensation over $500 — the tool cannot safely decide alone, so it pauses via `ctx.elicit()` and waits on a real supervisor decision (approve/decline/cancel) |
-| **Resources** | `server.py: duty_time_policy` (`policy://duty-time-limits`) | The duty-time policy is static reference data the model should *read once and reason over*, not a function to call repeatedly |
-| **Prompts** | `server.py: draft_disruption_message` | A canned, parameterized starting point ("draft an apology for flight X, reason Y") so every client doesn't reinvent this prompt |
-| **Sampling** | `sampling_logic.py: generate_disruption_notice` | The server needs a written passenger notice as part of a tool's own output, using real disruption data from the DB — it borrows the *connected client's* model via `ctx.session.create_message()`, not a model of its own |
-| **Transport (both)** | `server.py` `if __name__ == "__main__"` block; `client/client_stdio.py` vs `client/client_http.py` | Built stdio first for local development (see early commits), moved to Streamable HTTP as default because Blue Horizon is multi-location and many ops agents' clients need to reach one shared server, not spawn a subprocess each |
-| **Progress tracking** | `progress_logic.py: rebook_all_passengers_on_flight` | Rebooking every passenger on a cancelled flight one at a time genuinely takes a while — real `ctx.report_progress()` per passenger instead of one blocking response |
-| **Defensive tool design** | `tools_write.py` (all write tools) | Typed, constrained schemas + business-rule validation independent of the schema (duty hours, duplicate compensation, double-booking) + handler-level authorization (`requested_by`/`issued_by` must look like `agent_###`) |
-
-## 4. Repository Layout
+With the server running, a front-desk session sees `recall_flight_history` and
+`search_policy_manual` available from the start (read-only, like every other
+read tool). `run_memory_consolidation` only appears after `authenticate_supervisor`
+succeeds — registered inside that same handler, right next to
+`assign_reserve_crew` and `issue_compensation`, and announced via the same
+`notifications/tools/list_changed` push the notifications concern already used:
 
 ```
-mcp_server/      server.py, tools_read.py, tools_write.py, dbase.py,
-                 elicitation_logic.py, notifications_logic.py,
-                 sampling_logic.py, progress_logic.py
-db/              schema, seed data, ERD
-client/          client_stdio.py (dev), client_http.py (deployed)
-README.md
+=== Authenticating as supervisor sup_001 ===
+
+>>> NOTIFICATION RECEIVED: notifications/tools/list_changed <<<
+The server just told us its tool list changed.
+
+Supervisor sup_001 authenticated. assign_reserve_crew, issue_compensation, and
+run_memory_consolidation are now available.
 ```
 
-## 5. Running It
+See `demo_transcript.md` for the full end-to-end run.
 
-**Server (dev, stdio):**
-```
-cd mcp_server
-python server.py stdio
-```
+## 10. Setup
 
-**Server (deployed default, Streamable HTTP):**
-```
-cd mcp_server
-python server.py
+```bash
+pip install google-genai python-dotenv chromadb rank_bm25 mysql-connector-python mcp
 ```
 
-**Client (dev):**
+Add to `.env` (never commit this file — confirm it's in `.gitignore`):
 ```
-cd client
-python client_stdio.py
+GOOGLE_API_KEY=...
+DB_HOST=localhost
+DB_USER=root
+DB_PASSWORD=...
+DB_NAME=blue_horizon_db
 ```
-Connects over stdio, prints the tool list before and after supervisor
-authentication, and exercises the read/write/notification paths.
 
-**Client (HTTP):**
+Build the vector index once (subsequent runs reuse the persisted Chroma
+collection):
+```bash
+python rag/vector_store.py
 ```
-cd client
-python client_http.py
+
+Run the server (Streamable HTTP by default, `stdio` for local debugging):
+```bash
+python mcp_server/server.py
+python mcp_server/server.py stdio
 ```
-Talks to a running Streamable HTTP server instance instead of spawning a
-subprocess — this is the path a real multi-agent deployment would use.
 
-Both clients require a `.env` (see `mcp_server/.env.example`, never commit the
-real one) with the database credentials `dbase.py` reads via `os.getenv`.
+Run the evaluations that produced the tables above:
+```bash
+python context_eval/run_eval.py
+python retrieval_eval/run_eval.py
+```
 
-## 6. Comparison Note: Read-Only vs. Write, and What If a Capability Is Missing
+## 11. Team contributions
 
-| Tool | Type | Elicitation? | Why |
-|---|---|---|---|
-| `get_flight_status` | Read-only | No | No state change, safe by nature |
-| `get_passenger_booking` | Read-only | No | No state change |
-| `rebook_passenger` | Write | No | Validated deterministically (flight status, no double-booking) — no judgment call for a human |
-| `rebook_all_passengers_on_flight` | Write | No | Same validation as above, just batched — reports progress, not a decision point |
-| `generate_disruption_notice` | Read (side-effect: drafts text) | No (uses sampling instead) | Needs a model to write prose, not a human to decide |
-| `assign_reserve_crew` | Write | **Yes**, when duty-hour limits would be exceeded | A legal/safety limit — only a supervisor should be able to override it |
-| `issue_compensation` | Write | **Yes**, when amount > $500 | A financial threshold — large payouts need explicit sign-off |
-| `authenticate_supervisor` | State-changing (session role) | No | Gate itself, not a gated action |
+- **Memory system + context management evaluation** (`memory/`, `context_eval/`)
+- **RAG system** (`rag/`)
+- **Retrieval evaluation + live integration** (`retrieval_eval/`,
+  `mcp_server/memory_tools.py`, wiring into `tools_read.py` / `tools_write.py`
+  / `server.py` / clients, README + demo) — starts once `rag/` is merged, since
+  `retrieval_eval/` evaluates the architectures built there before the
+  integration work begins
 
-**If a client connects without elicitation support:** `assign_reserve_crew`
-and `issue_compensation` would have no way to surface the approval prompt.
-Rather than silently proceeding (a supervisor override happening with nobody
-actually consenting) or silently failing with no explanation, the design
-intent is that a client lacking elicitation should not be offered these two
-tools at all — the same gate that hides them from an unauthenticated
-front-desk session applies to a client that can't honor a human-in-the-loop
-pause. Read-only tools and the deterministic write tools (`rebook_passenger`)
-remain fully usable regardless.
-
-**If a client connects without sampling support:** `generate_disruption_notice`
-degrades — the static `draft_disruption_message` prompt template is still
-available as a fallback the host's own model can fill in.
-
-## 7. Where It Stands Now / What We'd Worry About in Production
-
-- A supervisor's approval to override a duty-hour limit is currently returned
-  only as text in the tool's response — it isn't written back into
-  `duty_time_logs` as a flag. In production we'd want an auditable record of
-  *which* overrides happened and who approved them, queryable later, not just
-  a string in a chat transcript.
-- `session_state` in `notifications_logic.py` is a single shared dict — fine
-  for this single-connection demo, but a real multi-agent deployment over
-  Streamable HTTP needs per-session authentication state, not one shared flag.
-- Hardcoded demo supervisor credentials (`notifications_logic.py`) are only
-  acceptable because this is a class project; production would need real
-  auth, not a PIN dictionary in source.
+See linked pull requests on each GitHub Issue for the detailed commit history
+per contributor.
