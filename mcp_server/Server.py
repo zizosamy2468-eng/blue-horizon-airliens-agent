@@ -1,7 +1,24 @@
 # server.py
 # Final version of the MCP server for the Blue Horizon Airlines project.
 #
-# WHAT'S NEW IN THIS VERSION:
+# WHAT'S NEW IN THIS VERSION (Decomposition & Planning lab):
+#   - A NEW, SEPARATE agent is wired in: the planning agent
+#     (planning/planning_agent_tools.py). It owns disruption-response
+#     PLANNING -- decomposing "resolve disruption for BH202" into a DAG,
+#     routing sub-tasks to Plan-and-Solve / Tree of Thoughts / LATS, and
+#     applying Self-Refine / Reflexion self-correction. This is a
+#     DIFFERENT agent from the memory/RAG agent (memory_tools.py) added
+#     in the previous lab -- the two additions below are the ONLY change
+#     in this file for this lab. Nothing under memory_tools.py,
+#     tools_read.py, or tools_write.py's memory-recording hooks was
+#     touched, and the planning agent does not import from or share
+#     state with any of them. It reuses the same MCP tools and database
+#     underneath (via planning/domain_actions.py -> tools_read.py /
+#     tools_write.py -> dbase.py), exactly as required.
+#
+# EVERYTHING BELOW THIS POINT THAT ISN'T THE TWO "--- Planning lab
+# addition ---" BLOCKS IS UNCHANGED FROM THE MEMORY & RAG LAB VERSION.
+#
 #   - Sampling: generate_disruption_notice (sampling_logic.py) asks the
 #     connected client's LLM to draft a passenger notice via
 #     ctx.session.create_message(), instead of the server assuming a model.
@@ -40,6 +57,18 @@ from progress_logic import rebook_all_passengers_on_flight
 from tools_search import search_knowledge_base
 from memory_tools import recall_flight_history, search_policy_manual, run_memory_consolidation
 
+# --- Planning lab addition: import the new, separate planning agent's
+# top-level tool. planning/ sits next to mcp_server/ at the repo root, so
+# this import assumes server.py is run with the repo root (or planning/)
+# on sys.path -- see the "run instructions" note near the bottom of this
+# file if you hit a ModuleNotFoundError here.
+from pathlib import Path
+
+_PLANNING_DIR = Path(__file__).resolve().parent.parent / "planning"
+sys.path.insert(0, str(_PLANNING_DIR))
+from planning_agent_tools import resolve_disruption  # noqa: E402
+# --- end Planning lab addition ---
+
 # =========================================================
 # CAPABILITY NEGOTIATION
 # =========================================================
@@ -66,6 +95,21 @@ mcp.tool()(search_knowledge_base)
 # available from the start like every other read-only tool above.
 mcp.tool()(recall_flight_history)
 mcp.tool()(search_policy_manual)
+
+# --- Planning lab addition ---
+# resolve_disruption is the planning agent's single top-level tool. It
+# is read/write internally (it can call rebook_passenger, issue_compensation,
+# assign_reserve_crew as part of resolving a disruption end to end), but
+# it applies the SAME authorization rules those underlying tools already
+# enforce (requested_by must be a valid ops agent id) -- so, like the
+# read-only tools above, it's safe to expose to every connected client
+# from the start rather than gating it behind authenticate_supervisor.
+# It is NOT gated behind supervisor auth because the individual write
+# actions it may call already gate themselves (e.g. a >$500 compensation
+# proposal still triggers the real elicitation flow inside
+# issue_compensation, unchanged).
+mcp.tool()(resolve_disruption)
+# --- end Planning lab addition ---
 
 
 # =========================================================
@@ -145,6 +189,10 @@ def duty_time_policy() -> str:
 # the host itself is using. This is distinct from generate_disruption_notice
 # above, which is the server actively requesting sampling from the client
 # mid-tool-call rather than just handing over a fill-in-the-blanks string.
+# Also distinct from the planning agent's refine_disruption_notice tool
+# (planning/planning_agent_tools.py), which drafts AND self-corrects a
+# notice against grounded + rubric critique server-side, rather than
+# handing a template to the client to fill in itself.
 @mcp.prompt()
 def draft_disruption_message(flight_number: str, disruption_reason: str) -> str:
     """
