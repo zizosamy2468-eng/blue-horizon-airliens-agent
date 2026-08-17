@@ -1,336 +1,226 @@
-# Blue Horizon IROPS Assistant — Memory & RAG Extension
+# Blue Horizon IROPS — Decomposition & Planning Agent
 
-This extends the existing Blue Horizon MCP Server Lab project (`mcp_server/`, `db/`)
-with a real long-term memory system and a real retrieval layer. Nothing in the
-original server, database, or tool set was rebuilt — this is growth on top of it.
+This extends the same Blue Horizon Airlines repo, `mcp_server/`, and database
+used in the MCP Server Lab and the Memory & RAG Lab. It adds a **new,
+separate agent** — the **planning agent** — that owns a different real
+problem than the memory/RAG agent: deciding, not just retrieving.
 
-## 1. The problem we found
+## The problem this agent owns
 
-Blue Horizon's IROPS (Irregular Operations) ops agents handle flight disruptions
-through the existing MCP server: checking flight status, assigning reserve crew,
-issuing compensation, rebooking passengers. Two real gaps showed up once we looked
-at how this would actually run day to day:
+**Resolving a flight disruption** (`resolve_disruption(flight_number,
+requested_by)`). When a flight goes `disrupted`, `delayed`, or `cancelled`,
+an ops agent has to decide, in order and sometimes reactively:
 
-**Gap 1 — no memory across sessions.** Every IROPS session starts from zero. If a
-supervisor approves a duty-hour override for a crew member at 9am, and a different
-ops agent picks up the same flight's disruption at 2pm, the system has no way to
-tell them that override already happened, or that the disruption cause was later
-reclassified from "mechanical" to "weather" by maintenance. Front-desk agents would
-re-ask and re-approve things that already have an answer. This has a real cost:
-duplicate compensation, or a crew member's duty-hour override getting requested
-twice for the same day when the first one already covers the situation.
+- who among the affected passengers actually needs handling,
+- whether reserve crew is needed, and if a candidate is near the duty-hour
+  limit, whether an override is worth requesting or a different crew
+  member should be picked instead,
+- how to search for a replacement route when the direct one isn't
+  available,
+- how to propose compensation without violating duplicate-claim or
+  loyalty-tier-multiplier rules, and
+- what to actually tell the passengers, without overstating an unconfirmed
+  cause as settled fact.
 
-**Gap 2 — no grounding in policy.** The original `search_knowledge_base` tool was
-four hardcoded sentences. Real IROPS decisions depend on an actual policy manual —
-compensation eligibility, duty-time override rules, rebooking priority, loyalty-tier
-multipliers — with real cross-references between sections (a compensation rule that
-only applies if a duty-time override also happened, IROPS-COMP-5 vs IROPS-DUTY-3).
-Nobody wants to turn 18 policy sections into 18 more MCP tools, and an agent
-guessing at policy instead of retrieving it is exactly the kind of hallucination
-that costs real money or breaks a real safety rule.
+This is not a single-call problem. No individual MCP tool
+(`get_flight_status`, `assign_reserve_crew`, `issue_compensation`,
+`rebook_passenger`) can safely resolve it alone — the tools are
+deliberately narrow (per the MCP Server Lab's own design), and the
+*ordering, branching, and correction* across them is exactly what was
+missing. A wrong plan has real cost: a duplicate compensation payout, an
+avoidable duty-hour override, or a notice that asserts an unconfirmed
+mechanical cause as fact (a real policy violation under `IROPS-MECH-1`).
 
-Both gaps needed the full architecture the lab asks for — a partial version
-(memory with no consolidation, or RAG with no verification) wouldn't have actually
-fixed either problem.
+This is a **different agent, different problem** from the memory/RAG lab
+(which answered retrieval questions — "what happened", "what does policy
+say"). This agent decides "what should happen next", which is why it needs
+its own decomposition, planning-algorithm, and self-correction machinery
+rather than reusing the memory/RAG agent's code path. `planning/` does not
+import from `memory_tools.py`, and nothing in `memory/` or `rag/` was
+touched for this lab.
 
-## 2. Extending the existing system
+## Which agent owns it
 
-`mcp_server/tools_read.py` and `mcp_server/tools_write.py` keep their original SQL
-and business logic untouched. The only addition is a `record_turn()` /
-`update_scratchpad()` call before each return, wired through the new
-`mcp_server/memory_tools.py`. `server.py` registers three new tools
-(`recall_flight_history`, `search_policy_manual`, `run_memory_consolidation`)
-using the exact same `mcp.tool()` / `mcp.add_tool()` pattern already used for every
-other tool in the file. The old `search_knowledge_base` tool is left in place for
-comparison but is superseded by `search_policy_manual`.
+`planning/planning_agent_tools.py` exposes one top-level MCP tool,
+`resolve_disruption`, registered in `mcp_server/server.py` alongside (not
+instead of) every existing tool from the previous two labs. See
+`mcp_server/server.py`'s `--- Planning lab addition ---` blocks for the
+exact two-line wiring.
 
-## 3. Repository structure
+Three narrower tools are also exposed directly, so each planning concern
+can be demonstrated in isolation without running the full pipeline:
+`select_reserve_crew_grounded` (LATS), `refine_disruption_notice`
+(Self-Refine), `propose_compensation_reflexion` (Reflexion).
 
-```
-memory/
-  short_term.py       rolling buffer + scratchpad
-  router.py            promote-or-drop routing (forget / episodic only)
-  episodic.py           episodic store (session-scoped, persisted to JSON)
-  semantic.py            semantic store (versioned, conflict-aware)
-  consolidation.py         the only writer to semantic.py, runs periodically
+## Where every concern lives
 
-context_eval/
-  llm_client.py        real Gemini calls for summarization + answering
-  test_suite.py         40-turn long-context test transcripts, 10 variations
-  strategies.py           all four context management strategies
-  run_eval.py                comparison table + strategy selection
+| Concern | File | What to look for |
+|---|---|---|
+| DAG construction + acyclicity | `planning/dag.py` | `TaskDAG.add_edge()` — rejects a cycle at insertion time, not after |
+| Decomposition-first | `planning/decomposition.py` | `build_plan()` — one LLM call, whole DAG up front |
+| Dynamic/interleaved decomposition | `planning/dynamic_decomposition.py` | `run_dynamic_decomposition()` — one sub-task per LLM call, real observation fed back before the next decision |
+| Routing (PS vs ToT vs LATS) | `planning/router.py` | `route_sub_task()` — reads the action's `shape` from `domain_actions.ACTIONS`, no LLM call needed for the routing decision itself |
+| Plan-and-Solve | `planning/plan_and_solve.py` | `plan()` (phase 1) / `solve()` (phase 2) — single pass, no branching |
+| Tree of Thoughts | `planning/tree_of_thoughts.py` | `generate_candidates()` + `evaluate_candidate()` — **ungrounded**, self-scored |
+| LATS | `planning/lats.py` | `run_lats()` — select/expand/evaluate/backpropagate loop, **grounded** via `environment.py` |
+| Grounded environment | `planning/environment.py` | `check_crew_assignment_feasibility()`, `check_compensation_validity()` — real `duty_time_logs`/`compensation` queries, replacing the toolkit's randomized default |
+| Self-Refine | `planning/self_refine.py` | `self_refine_notice()` — one draft, one grounded + one rubric critique, one revision |
+| Reflexion | `planning/reflexion.py` | `run_reflexion()` — capped reflection buffer (`reflection_buffer_cap`) carried across trials |
+| Orchestration + evidence trace | `planning/planning_agent_tools.py` | `resolve_disruption()` — wires all of the above, saves JSON to `artifacts/` |
+| Test suite (fixed) | `planning_eval/test_suite.py` | 13 real cases across 5 categories |
+| Comparison harness | `planning_eval/run_eval.py` | runs every method against every applicable case |
 
-rag/
-  policy_corpus.py     the 18-section IROPS policy manual (the RAG corpus)
-  embeddings.py          Gemini embedding pipeline
-  vector_store.py          Chroma vector DB (HNSW + metadata filtering)
-  naive_rag.py                architecture 1/3
-  hybrid_rag.py                 architecture 2/3 (vector + BM25)
-  agentic_rag.py                  architecture 3/3 (multi-hop function calling)
-  self_rag.py                       relevance + support verification, both RAG and memory recall
+## Grounded vs. ungrounded — the deliberate swap
 
-retrieval_eval/
-  test_questions.py    12 domain questions across general/citation/multi_part
-  run_eval.py             comparison table + architecture selection
+`tree_of_thoughts.py` and `lats.py` are run against the **same decision**:
+which crew member to assign as reserve for BH202. This is intentional —
+it's the lab's required "swap an ungrounded self-critique for a grounded
+one on the same sub-task" case.
 
-mcp_server/
-  memory_tools.py       the only new file wiring memory/ and rag/ into the live server
-  tools_read.py, tools_write.py, server.py    unchanged logic, memory hooks added
-client/
-  client_stdio.py, client_http.py    updated to exercise the new tools
-```
+- **ToT (ungrounded):** the model scores its own candidates from what's
+  typed into its prompt. In our real run, it gave `crew_id=1` (Capt. Karim
+  Mostafa, 13.0h duty logged) a self-score of **10/10**, reasoning that 13
+  hours was "within standard operational limits."
+- **LATS (grounded):** the same candidate, evaluated by a real
+  `duty_time_logs` query (`environment.check_crew_assignment_feasibility`),
+  scored **5.5/10** — correctly reflecting that only 0.5h of headroom
+  remained before the real 14h duty limit, a fact the ungrounded self-score
+  had no access to and simply didn't weigh.
 
-## 4. Memory architecture
+Both picked the same candidate in this run (there was no better-rested
+option available), but the **score itself** shows the gap: ToT's self-belief
+(10/10, "within standard limits") versus LATS's grounded number (5.5/10,
+"0.5h headroom") are describing the same real crew member very
+differently. In a scenario with a better-rested alternative crew member
+available, this score gap is what would flip LATS's decision away from the
+near-limit candidate while ToT's self-score would still confidently pick
+them — that is the concrete failure mode grounding exists to catch.
 
-**Short-term memory + scratchpad** (`memory/short_term.py`): a token-bounded
-rolling buffer of turns, and a separate flat scratchpad (`current_flight`,
-`current_goal`, `sub_goal`, `working_facts`, `pending_decisions`) that is never
-touched by buffer pruning. Verified directly — after the buffer was fully drained
-to 0 turns, the scratchpad still held the full working state:
+## Comparison table (real runs, real Gemini calls, `planning_eval/comparison_results.json`)
 
-```
-Final snapshot:
-{'session_id': 'BH202-2026-08-02', 'buffer_turns': 0, 'buffer_tokens': 0,
- 'scratchpad': {'current_flight': 'BH202', 'current_goal': 'resolve disruption for BH202',
- 'sub_goal': 'check crew duty hours before assigning reserve crew',
- 'working_facts': {'disruption_reason': 'mechanical'},
- 'pending_decisions': ['awaiting supervisor approval for crew_id=1 duty override']}}
-```
+### Decomposition-first vs. dynamic (6 applicable cases)
 
-**Promote-or-drop routing** (`memory/router.py`): fires when the buffer overflows.
-A transparent, rule-based scorer (financial / operational / authorization /
-root-cause signal keywords) decides forget vs. episodic per turn, with the full
-reasoning logged. It never writes to semantic memory. In one drain of 5 turns, 2
-were promoted (a disruption status with a root-cause fact, and a supervisor
-override) and 3 were dropped as routine noise — and the scratchpad was untouched
-by any of it.
-
-**Episodic memory** (`memory/episodic.py`): promoted turns persisted to disk with
-extracted flight numbers, amounts, and supervisor IDs, so a session tomorrow can
-pull up today's history without re-asking:
-
-```
---- Simulating tomorrow: a NEW session pulls up BH202's history ---
-Found 1 past episodes about BH202 without re-asking anything:
-  - Flight BH202: CAI to LHR - Status: disrupted - Reason: mechanical
-```
-
-**Semantic memory consolidation** (`memory/consolidation.py`, the only writer to
-`memory/semantic.py`): a separate periodic pass over episodic memory — never
-triggered inline by the router. It extracts (subject, predicate, value) facts,
-scores authority by source (supervisor-involved > confirmed > unconfirmed), and
-resolves conflicts explicitly rather than silently overwriting. Real conflict
-resolved by a live consolidation run — an initial unconfirmed "mechanical" report
-for BH202 vs. a later maintenance-confirmed "weather" report:
-
-```
-=== Consolidation run summary ===
- - NEW BH202.disruption_reason = mechanical
- - CONFLICT BH202.disruption_reason: 'mechanical' (auth=1) vs 'weather' (auth=2) -> kept 'weather'
- - NEW policy:compensation_cap.auto_approve_cap_usd = 750
-
-new_facts=2 updates=0 conflicts_resolved=1
-```
-
-The losing version (`mechanical`, authority 1) is not deleted — it's retained with
-`status=superseded_due_to_conflict` and a `conflict_notes` field explaining exactly
-what it lost to. A separate, non-conflicting case (the compensation cap rising from
-500 to 750 USD) is handled as a routine update instead, since it isn't two
-sources disagreeing about the same fact, just a policy value changing over time.
-
-## 5. Context window management — all four strategies
-
-Test suite: 10 seeded 40-turn transcripts, each burying one critical fact (a
-supervisor's duty-hour override for a specific crew member) under ~36 turns of
-realistic tool-call noise, including near-duplicate but non-critical override
-mentions for other crew members. Each strategy's pruned output is fed to a real
-Gemini call, and a run only counts as correct if the model's actual answer
-contains the required markers.
-
-| Strategy | Accuracy | Avg input tokens | Avg output tokens | Avg latency |
+| Method | Accuracy | Avg LLM calls | Avg tokens | Avg latency |
 |---|---|---|---|---|
-| Sliding window (last 10 turns) | 0/10 | 534 | 24 | 1.21s |
-| Observation masking | 10/10 | 1246 | 53 | 0.79s |
-| Recursive summarization | 8/10 | 770 | 216 | 11.97s |
-| Zone-based pruning | 10/10 | 1554 | 55 | 0.90s |
+| decomposition_first | 5/6 | 1 | 520 | 1.56s |
+| dynamic | 5/6 | 3 | 1,635 | 4.59s |
 
-**Chosen: Observation masking.** Sliding window failed outright — the critical
-fact sits early in the transcript and falls straight out of a fixed 10-turn
-window, which is exactly the real failure mode for a tool-heavy IROPS session.
-Recursive summarization preserved the fact in 8/10 runs but at nearly 15× the
-latency of observation masking, because it makes real per-chunk LLM calls to
-compress older turns. Zone-based pruning tied observation masking at 10/10, but
-cost more input tokens (1554 vs. 1246) and higher latency (0.90s vs. 0.79s) for
-no accuracy benefit given this transcript shape — Blue Horizon's IROPS sessions
-are bloated by tool-call JSON, not dialogue, which observation masking targets
-directly by keeping any significance-flagged tool output regardless of age.
+**Divergence observed on `BH202`:** decomposition-first committed to a
+3-node fixed plan (`check_flight_status`, `evaluate_crew_needs`,
+`identify_passengers`) before seeing any real result. Dynamic decomposition
+observed the real result of `get_candidate_replacement_flights` (an empty
+list — no CAI→LHR replacement exists in the seed data) and **stopped
+itself**, explicitly reasoning: *"no candidate replacement flights are
+available to rebook the affected passenger... no further automated actions
+can resolve the passenger's travel needs."* Decomposition-first has no
+mechanism to react to that — it would have kept running its fixed 3 nodes
+regardless of what `get_candidate_replacement_flights` returned, because it
+never calls that action at all in its up-front plan. This is exactly the
+lab's required "early surprise reshapes the rest of the plan" case, at
+~3x the token/latency cost.
 
-## 6. Vector database architecture
+**Why decomposition-first still ships as the default** for the fully
+mechanical sub-tasks (status checks, single-passenger notices — the
+`decomposition_first_favored` test cases): the table shows dynamic paying
+3x the LLM calls and tokens for cases where nothing actually changes
+mid-plan. Dynamic decomposition is the one that gets routed to when
+`resolve_disruption` is called for an active disruption with unresolved
+rebooking/crew/compensation needs, where the reactivity has already been
+shown to matter.
 
-`rag/vector_store.py` uses Chroma with an HNSW index built automatically per
-collection, chunk metadata (category, title, last_reviewed) stored alongside each
-vector, and a `where=` metadata filter applied *before* the similarity search, not
-after. Verified directly — filtering to `category='duty_time'` on a query that
-literally mentions "compensation" still returns only duty-time sections:
+### Plan-and-Solve vs. Tree of Thoughts vs. LATS (reserve-crew selection)
 
-```
-=== Filtered search (category='duty_time'): 'compensation cap amount' ===
-(query mentions compensation, but the where= filter forces duty_time-only candidates)
-  0.511  [IROPS-DUTY-3] Supervisor override for duty-time limits during IROPS
-  0.502  [IROPS-DUTY-1] Standard duty-time limits
-  0.490  [IROPS-DUTY-5] Duty-time override does not apply retroactively
-```
-
-## 7. Retrieval architectures — three required
-
-Test suite: 12 questions across three categories (general, citation-heavy,
-multi-part/decomposition), 4 per category, evaluated through the **verified**
-entry points in `rag/self_rag.py` so the table reflects what the live agent would
-actually hand back — including any answer replaced or refused by the Self-RAG
-check.
-
-| Architecture | Accuracy | Avg tokens/query | Avg latency/query | By category |
+| Method | Accuracy | Avg LLM calls | Avg tokens | Avg latency |
 |---|---|---|---|---|
-| Naive RAG | 11/12 | 474.5 | 1.69s | general=4/4, citation=4/4, multi_part=3/4 |
-| Hybrid search | 11/12 | 476.2 | 1.89s | general=4/4, citation=4/4, multi_part=3/4 |
-| Agentic RAG | 12/12 | 1120.8 | 3.06s | general=4/4, citation=4/4, multi_part=4/4 |
+| plan_and_solve | 1/1 | 1 | 187 | 0.78s |
+| tree_of_thoughts | 1/1 | 4 | 1,270 | 5.57s |
+| lats_ungrounded (toolkit default, for contrast only) | 0/1 | 1 | 0 | 0.0s |
+| lats_grounded (real, shipped) | 1/1 | 1 | 301 | 1.08s |
 
-**Justification (based on the actual numbers above):**
-- Naive RAG and hybrid search both scored 11/12 overall, with identical
-  per-category results (general=4/4, citation=4/4, multi_part=3/4).
-- Agentic RAG was the only architecture to get every multi-part question right
-  (4/4) and finished at 12/12 overall, but at roughly 3.06s and 1121 tokens per
-  query — about 1.6× the latency and 2.3× the tokens of hybrid search.
-- In this particular test run, the citation-heavy questions happened to be
-  retrievable by pure vector search as well, so hybrid did not show a clear
-  accuracy edge over naive here. Hybrid is still preferred over naive as the
-  **default**, because it is structurally robust to exact policy-code lookups
-  (the failure mode hybrid search was specifically built for — an embedding
-  model doesn't treat "4.2b" as a meaningful token, BM25 does) at almost no
-  extra token or latency cost, and a larger or differently-worded citation set
-  could easily expose the gap this run didn't happen to surface.
-- Blue Horizon's live IROPS call volume is dominated by quick general and
-  citation questions during active disruptions, where an ops agent on the
-  phone cannot wait several seconds for a multi-hop reasoning loop. **Hybrid
-  search ships as the default retrieval path**, and multi-part /
-  decomposition-shaped questions (detectable from question length and the
-  presence of multiple distinct entities/conditions) are routed to the
-  **agentic path** instead.
+Plan-and-Solve is cheapest and got lucky on this single-candidate-obvious
+case, but it never compares alternatives — it is routed to sub-tasks with
+no real branching (rebooking assignment order), not crew selection.
+Tree of Thoughts costs ~7x Plan-and-Solve's tokens to generate and
+self-score 3 candidates. LATS-grounded matches ToT's correctness at a
+fraction of the cost (1 LLM call vs. 4) because its grounded evaluate step
+doesn't need an LLM call at all — it queries the database directly. The
+`lats_ungrounded` row (the toolkit's original randomized-score default,
+kept only for this contrast, never shipped) has no real signal by
+construction and scores accordingly. **LATS-grounded ships for crew
+selection**; ToT is kept for sub-tasks with real multi-way tradeoffs but no
+existing real-time validator to check against (e.g. rebooking priority
+ordering across several loyalty tiers at once).
 
-A concrete example of the agentic path earning its cost — a genuinely
-decomposition-shaped question resolved in 2 hops, pulling from 5 different
-policy sections across compensation, mechanical-cause, and duty-time categories
-that a single-shot retrieval on the whole question would not have surfaced
-together:
+### Self-Refine vs. Reflexion
 
-```
-Q: A gold-tier passenger is on flight BH202, which is disrupted for a mechanical
-reason, and the crew member we'd assign as reserve already needs a duty-time
-override. What compensation applies to the passenger, and what has to happen
-before we can assign that crew member?
+| Method | Accuracy | Avg LLM calls | Avg tokens | Avg latency |
+|---|---|---|---|---|
+| self_refine | 2/2 | 3 | 507 | 3.06s |
+| reflexion | 2/2 | 3 | 1,001.5 | 2.79s |
 
-Hops used: 2
-Retrieved across all hops: ['IROPS-COMP-5', 'IROPS-MECH-1', 'IROPS-COMP-1',
-'IROPS-CREW-1', 'IROPS-DUTY-4', 'IROPS-DUTY-5', 'IROPS-DUTY-1', 'IROPS-DUTY-3']
-tokens=2773 latency=15.977s
-```
+Both hit 100% on their respective fixed test cases, but they are **not**
+interchangeable — they were run on different sub-task types on purpose.
+Self-Refine's real run on BH202 caught a genuine grounded violation: the
+draft asserted *"a confirmed mechanical fault"* as settled fact, and the
+grounded critique (a live `flights` table read, not model opinion) flagged
+it against `IROPS-MECH-1` and produced a corrected revision saying *"an
+operational issue"* instead — one draft, one grounded critique, one
+revision, exactly proportionate to a cheap-to-redraft output.
+Reflexion's real run needed genuine cross-trial memory: trial 0 proposed
+100 USD for Mona Khaled and failed the grounded `check_compensation_validity`
+check (she already had an approved 150 USD claim on file); the reflection
+*"perform a pre-check against the current compensation ledger"* was carried
+into trial 1, which correctly proposed nothing further and marked her
+`already_covered`. A single Self-Refine-style revision without a second
+real evaluate pass could not have confirmed the fix actually worked — that
+confirmation is Reflexion's job.
 
-## 8. Self-RAG-style verification
+## Known limitation (documented honestly, not hidden)
 
-`rag/self_rag.py` runs two explicit LLM-judged checks before any answer reaches
-the user — relevance (is each retrieved passage actually relevant?) and support
-(is the generated answer actually backed by what passed relevance?) — and applies
-identically to RAG answers and to episodic/semantic memory recall
-(`recall_flight_history` uses this same check).
+`decomposition.py` and `dynamic_decomposition.py` currently execute a
+sub-task's assigned domain action **directly** (via
+`domain_actions.run_action`) rather than first checking `router.py`'s
+routing decision and dispatching `reasoning`-shaped actions
+(`assign_reserve_crew`) through `tree_of_thoughts.py`/`lats.py` before
+execution. In real runs this surfaces as `assign_reserve_crew() missing 1
+required positional argument: 'ctx'` whenever a DAG plan includes that
+action directly — `assign_reserve_crew` is an async, context-bound MCP
+tool (it needs a live `ctx` for elicitation), not a plain callable safe to
+invoke outside a routed planning step. The standalone algorithm files
+(`tree_of_thoughts.py`, `lats.py`) do not have this problem — they never
+call `assign_reserve_crew` directly, they only read from
+`environment.py`'s grounded checks. The fix (routing DAG nodes through
+`router.py` before execution instead of calling `run_action` unconditionally
+for every node) is scoped but not yet applied; `planning_eval/run_eval.py`'s
+decomposition-comparison numbers above are unaffected because that harness
+scores plan shape and stopping behavior, not this specific action's
+execution success.
 
-A visible consequence when relevance fails, from a mixed-relevance memory recall
-check against the question "what caused BH202's disruption":
-
-```json
-{
-  "verified": true,
-  "checks": [
-    {
-      "item": "disruption_reason: weather",
-      "relevant": true,
-      "reason": "The passage explicitly identifies weather as the cause of the disruption for BH202."
-    },
-    {
-      "item": "auto_approve_cap_usd: 750",
-      "relevant": false,
-      "reason": "The passage provides a financial limit and contains no information regarding the disruption of BH202."
-    }
-  ]
-}
-```
-
-The compensation-cap fact was correctly filtered out — it matched nothing about
-the question asked, even though it lives in the same store. Nothing irrelevant
-was allowed through just because it was recalled successfully.
-
-## 9. Live integration
-
-With the server running, a front-desk session sees `recall_flight_history` and
-`search_policy_manual` available from the start (read-only, like every other
-read tool). `run_memory_consolidation` only appears after `authenticate_supervisor`
-succeeds — registered inside that same handler, right next to
-`assign_reserve_crew` and `issue_compensation`, and announced via the same
-`notifications/tools/list_changed` push the notifications concern already used:
-
-```
-=== Authenticating as supervisor sup_001 ===
-
->>> NOTIFICATION RECEIVED: notifications/tools/list_changed <<<
-The server just told us its tool list changed.
-
-Supervisor sup_001 authenticated. assign_reserve_crew, issue_compensation, and
-run_memory_consolidation are now available.
-```
-
-See `demo_transcript.md` for the full end-to-end run.
-
-## 10. Setup
+## Run instructions
 
 ```bash
-pip install google-genai python-dotenv chromadb rank_bm25 mysql-connector-python mcp
-```
-
-Add to `.env` (never commit this file — confirm it's in `.gitignore`):
-```
+# .env (repo root) needs both the existing DB_* vars and:
 GOOGLE_API_KEY=...
-DB_HOST=localhost
-DB_USER=root
-DB_PASSWORD=...
-DB_NAME=blue_horizon_db
+
+cd planning
+python dag.py                     # no LLM, pure structure + cycle check
+python decomposition.py           # decomposition-first demo (BH202)
+python dynamic_decomposition.py   # dynamic demo (BH202)
+python router.py                  # routing decisions, no LLM
+python plan_and_solve.py          # PS demo (rebooking)
+python tree_of_thoughts.py        # ToT demo (crew selection, ungrounded)
+python environment.py             # grounded checks, real DB queries
+python lats.py                    # LATS demo (crew selection, grounded)
+python self_refine.py             # Self-Refine demo (notice drafting)
+python reflexion.py               # Reflexion demo (batch compensation)
+python planning_agent_tools.py    # full orchestrator, both decomposition modes
+
+cd ../planning_eval
+python run_eval.py                # full comparison table -> comparison_results.json
 ```
 
-Build the vector index once (subsequent runs reuse the persisted Chroma
-collection):
+To run the live server with the planning agent registered:
 ```bash
-python rag/vector_store.py
+cd mcp_server
+python server.py stdio            # or plain `python server.py` for Streamable HTTP
 ```
-
-Run the server (Streamable HTTP by default, `stdio` for local debugging):
-```bash
-python mcp_server/server.py
-python mcp_server/server.py stdio
-```
-
-Run the evaluations that produced the tables above:
-```bash
-python context_eval/run_eval.py
-python retrieval_eval/run_eval.py
-```
-
-## 11. Team contributions
-
-- **Memory system + context management evaluation** (`memory/`, `context_eval/`)
-- **RAG system** (`rag/`)
-- **Retrieval evaluation + live integration** (`retrieval_eval/`,
-  `mcp_server/memory_tools.py`, wiring into `tools_read.py` / `tools_write.py`
-  / `server.py` / clients, README + demo) — starts once `rag/` is merged, since
-  `retrieval_eval/` evaluates the architectures built there before the
-  integration work begins
-
-See linked pull requests on each GitHub Issue for the detailed commit history
-per contributor.
