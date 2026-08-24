@@ -67,6 +67,7 @@ from hybrid_rag import BM25PolicyIndex, hybrid_search  # noqa: E402
 from self_rag import verify_memory_recall, verify_rag_answer  # noqa: E402
 from vector_store import PolicyVectorStore  # noqa: E402
 
+
 # -----------------------------------------------------------
 # Session-scoped state. One ShortTermMemory per active IROPS session,
 # shared stores for episodic/semantic since those persist across sessions
@@ -231,6 +232,23 @@ def run_memory_consolidation() -> str:
         f"new_facts={result['new_facts']} updates={result['updates']} "
         f"conflicts_resolved={result['conflicts_resolved']}\n\n{lines}"
     )
+
+# =========================================================
+# COMPENSATION APPEAL — memory side-effect helper
+# =========================================================
+def record_appeal_event(
+    flight_number: str,
+    content: str,
+    role: str = "tool_result",
+) -> None:
+    """
+    Record one compensation-appeal event into the flight's short-term
+    memory buffer (and promote-or-drop if overflowing). Used by the
+    Compensation Appeal graph so appeal decisions survive across sessions
+    the same way IROPS tool results do.
+    """
+    session_id = get_session_id(flight_number)
+    record_turn(session_id=session_id, role=role, content=content)
 
 
 if __name__ == "__main__":
