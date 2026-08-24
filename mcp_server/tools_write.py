@@ -1,3 +1,34 @@
+# tools_write.py
+# All WRITE tools live here -- the ones that actually change real state
+# (crew assignments, money, bookings). These are the risky ones, so each
+# function here has three things on purpose:
+#   1) Server-side validation that does NOT depend on the input schema
+#      (the schema only checks shape/type, not business rules).
+#   2) An authorization check done INSIDE the handler (requested_by / issued_by
+#      must be a valid-looking ops agent ID).
+#   3) A safety check tied to real data (duty hours, existing compensation,
+#      existing bookings) before any INSERT/UPDATE happens.
+#
+# ELICITATION: assign_reserve_crew and issue_compensation are now async and
+# take a `ctx: Context` parameter. FastMCP injects this automatically because
+# the parameter is named/typed as Context. When these tools hit a risky
+# situation (pilot near/over duty-hour limit, compensation over the
+# auto-approve cap), they no longer just reject -- they call
+# request_supervisor_approval(ctx, ...), which pauses the tool call and asks
+# a human on the client side to approve or decline. See elicitation_logic.py.
+#
+# MEMORY INTEGRATION (added for the Memory & RAG lab): every return path --
+# rejections included, not just approvals -- now calls record_turn() so the
+# promote-or-drop router sees the full picture of what was attempted during
+# a session, not just what succeeded. A rejected duplicate-compensation
+# attempt is exactly the kind of thing worth remembering.
+#
+# One small necessary schema addition: rebook_passenger's SELECT now also
+# pulls f.flight_number (it wasn't selected before), because a session_id
+# has to be derived from the flight being handled and the original query
+# didn't expose it. Nothing else about that query changed.
+#
+# The actual @mcp.tool() registration happens in server.py.
 
 from typing import Literal
 from mcp.server.fastmcp import Context
@@ -405,6 +436,7 @@ def rebook_passenger(
         cursor.close()
         conn.close()
 
+
 def mark_flight_ready(
     flight_number: str,
     run_id: str,
@@ -509,4 +541,94 @@ def mark_flight_ready(
 
     finally:
         cursor.close()
-        conn.close()       
+        conn.close()
+
+
+def submit_compensation_payment(
+    passenger_email: str,
+    flight_number: str,
+    amount: float,
+    currency: str,
+    run_id: str,
+) -> dict:
+    """
+    Mock payment gateway for the Compensation Appeal agent.
+
+    Run-scoped exactly like mark_flight_ready above: only works with a
+    real run_id that belongs to a compensation_appeal workflow, and it
+    persists the gateway reference into compensation_appeals so the
+    platform's admin surface can show real payment status, not just what
+    is inside the checkpointed state_json.
+
+    Returns a submission ack. The real paid/rejected outcome arrives
+    later via state_graph/external_events.py's inject_payment_result
+    (simulating an async gateway webhook).
+    """
+    if not passenger_email or not flight_number:
+        raise ValueError("passenger_email and flight_number are required.")
+    if amount <= 0:
+        raise ValueError("amount must be positive.")
+    if not run_id or not run_id.strip():
+        raise ValueError("run_id is required.")
+
+    conn = get_connection()
+    cursor = conn.cursor(dictionary=True)
+
+    try:
+        cursor.execute(
+            "SELECT workflow_type FROM workflow_runs WHERE run_id = %s",
+            (run_id,),
+        )
+        workflow_run = cursor.fetchone()
+
+        if workflow_run is None:
+            raise LookupError(f"No workflow run found with ID '{run_id}'.")
+
+        if workflow_run["workflow_type"] != "compensation_appeal":
+            raise ValueError(
+                "submit_compensation_payment can only be used by a "
+                "compensation_appeal workflow."
+            )
+
+        # ---- mock payment gateway call ----
+        # 9999.99 is a deterministic "test card number"-style trigger for
+        # the failure-ticket demo (tests/test_ticket_recovery.py) -- a
+        # real failure path exercised on purpose, not a random flake and
+        # not a manually inserted ticket row.
+        if amount == 9999.99:
+            raise RuntimeError("Mock payment gateway unavailable (timeout).")
+
+        payment_reference = f"PAY-{run_id[:8].upper()}-{int(amount)}"
+
+        cursor.execute(
+            """
+            UPDATE compensation_appeals
+            SET payment_reference = %s,
+                payment_gateway_status = 'submitted',
+                appeal_status = 'submitting_payment'
+            WHERE run_id = %s
+            """,
+            (payment_reference, run_id),
+        )
+
+        if cursor.rowcount != 1:
+            raise LookupError(
+                f"No compensation_appeals row found for run_id '{run_id}'."
+            )
+
+        conn.commit()
+
+        return {
+            "payment_reference": payment_reference,
+            "status": "submitted",
+            "amount": amount,
+            "currency": currency,
+        }
+
+    except Exception:
+        conn.rollback()
+        raise
+
+    finally:
+        cursor.close()
+        conn.close()
