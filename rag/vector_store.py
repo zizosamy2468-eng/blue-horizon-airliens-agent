@@ -25,6 +25,10 @@ from policy_corpus import PolicySection
 COLLECTION_NAME = "irops_policy_manual"
 PERSIST_DIR = "./chroma_db"  # created next to this file on first run
 
+# Safety Incident Agent (Adel) filters by category="safety" when retrieving
+# IROPS-SAFE-* sections. Rebuild the collection after policy_corpus changes
+# so new safety sections are indexed (PolicyVectorStore(rebuild=True)).
+
 
 @dataclass
 class SearchResult:
