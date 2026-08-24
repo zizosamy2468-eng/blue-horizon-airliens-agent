@@ -1,34 +1,3 @@
-# tools_write.py
-# All WRITE tools live here -- the ones that actually change real state
-# (crew assignments, money, bookings). These are the risky ones, so each
-# function here has three things on purpose:
-#   1) Server-side validation that does NOT depend on the input schema
-#      (the schema only checks shape/type, not business rules).
-#   2) An authorization check done INSIDE the handler (requested_by / issued_by
-#      must be a valid-looking ops agent ID).
-#   3) A safety check tied to real data (duty hours, existing compensation,
-#      existing bookings) before any INSERT/UPDATE happens.
-#
-# ELICITATION: assign_reserve_crew and issue_compensation are now async and
-# take a `ctx: Context` parameter. FastMCP injects this automatically because
-# the parameter is named/typed as Context. When these tools hit a risky
-# situation (pilot near/over duty-hour limit, compensation over the
-# auto-approve cap), they no longer just reject -- they call
-# request_supervisor_approval(ctx, ...), which pauses the tool call and asks
-# a human on the client side to approve or decline. See elicitation_logic.py.
-#
-# MEMORY INTEGRATION (added for the Memory & RAG lab): every return path --
-# rejections included, not just approvals -- now calls record_turn() so the
-# promote-or-drop router sees the full picture of what was attempted during
-# a session, not just what succeeded. A rejected duplicate-compensation
-# attempt is exactly the kind of thing worth remembering.
-#
-# One small necessary schema addition: rebook_passenger's SELECT now also
-# pulls f.flight_number (it wasn't selected before), because a session_id
-# has to be derived from the flight being handled and the original query
-# didn't expose it. Nothing else about that query changed.
-#
-# The actual @mcp.tool() registration happens in server.py.
 
 from typing import Literal
 from mcp.server.fastmcp import Context
@@ -435,3 +404,109 @@ def rebook_passenger(
     finally:
         cursor.close()
         conn.close()
+
+def mark_flight_ready(
+    flight_number: str,
+    run_id: str,
+    released_by: str,
+) -> str:
+    """
+    Marks a disrupted, delayed, or cancelled flight as scheduled again.
+
+    This action is allowed only after the Maintenance Release State Graph
+    has received a cleared maintenance report and a real operations-manager
+    approval through the HITL flow.
+    """
+    if not flight_number or not flight_number.strip():
+        raise ValueError("flight_number is required.")
+
+    if not run_id or not run_id.strip():
+        raise ValueError("run_id is required.")
+
+    if not released_by or not released_by.startswith("ops_manager_"):
+        raise ValueError(
+            "released_by must be an operations manager ID, "
+            "for example 'ops_manager_001'."
+        )
+
+    conn = get_connection()
+    cursor = conn.cursor(dictionary=True)
+
+    try:
+        cursor.execute(
+            """
+            SELECT flight_number, status, disruption_reason
+            FROM flights
+            WHERE flight_number = %s
+            """,
+            (flight_number,),
+        )
+
+        flight = cursor.fetchone()
+
+        if flight is None:
+            raise LookupError(
+                f"No flight found with number '{flight_number}'."
+            )
+
+        cursor.execute(
+            """
+            SELECT workflow_type
+            FROM workflow_runs
+            WHERE run_id = %s
+            """,
+            (run_id,),
+        )
+
+        workflow_run = cursor.fetchone()
+
+        if workflow_run is None:
+            raise LookupError(
+                f"No workflow run found with ID '{run_id}'."
+            )
+
+        if workflow_run["workflow_type"] != "maintenance_release":
+            raise ValueError(
+                "mark_flight_ready can only be used by a "
+                "maintenance_release workflow."
+            )
+
+        if flight["status"] == "scheduled":
+            return (
+                f"Flight {flight_number} is already scheduled. "
+                "No database update was needed."
+            )
+
+        allowed_statuses = {"disrupted", "delayed", "cancelled"}
+
+        if flight["status"] not in allowed_statuses:
+            raise ValueError(
+                f"Flight {flight_number} has unsupported status "
+                f"'{flight['status']}'."
+            )
+
+        cursor.execute(
+            """
+            UPDATE flights
+            SET
+                status = 'scheduled',
+                disruption_reason = NULL
+            WHERE flight_number = %s
+            """,
+            (flight_number,),
+        )
+
+        conn.commit()
+
+        return (
+            f"Flight {flight_number} was marked ready by {released_by}. "
+            f"Workflow run: {run_id}."
+        )
+
+    except Exception:
+        conn.rollback()
+        raise
+
+    finally:
+        cursor.close()
+        conn.close()       
