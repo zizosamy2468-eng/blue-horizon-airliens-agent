@@ -214,9 +214,9 @@ Each resume picked up from the **exact node** the run had paused or failed on â€
 
 | Owner | Owns | Key files |
 |---|---|---|
-| Mostafa | Shared foundation + Maintenance Release Coordinator | `state_graph/models.py`, `checkpoint_store.py`, `runner.py`, `tool_registry.py`, `maintenance/` |
-| Zizo | Compensation Appeal Agent + HITL/Ticket base | `state_graph/compensation/`, `hitl.py`, `tickets.py`, `external_events.py` |
-| Adel | Safety Incident Agent + the full platform | `state_graph/safety/`, `web_platform/backend`, `web_platform/frontend` |
+| Mostafa farag | Shared foundation + Maintenance Release Coordinator | `state_graph/models.py`, `checkpoint_store.py`, `runner.py`, `tool_registry.py`, `maintenance/` |
+| abdelaziz samy | Compensation Appeal Agent + HITL/Ticket base | `state_graph/compensation/`, `hitl.py`, `tickets.py`, `external_events.py` |
+| mostafa Adel | Safety Incident Agent + the full platform | `state_graph/safety/`, `web_platform/backend`, `web_platform/frontend` |
 
 Every issue states the real constraint and acceptance criteria, one owner each, closed by a linked pull request.
 
