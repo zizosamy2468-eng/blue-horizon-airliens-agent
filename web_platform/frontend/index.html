@@ -1,0 +1,83 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Blue Horizon — Platform</title>
+  <link rel="stylesheet" href="styles.css" />
+</head>
+<body>
+  <header>
+    <h1>Blue Horizon Platform</h1>
+    <p class="subtitle">Agents · HITL · Tickets · Safety</p>
+    <nav>
+      <button data-view="dashboard" class="active">Dashboard</button>
+      <button data-view="agents">Agents</button>
+      <button data-view="hitl">HITL Review</button>
+      <button data-view="tickets">Tickets</button>
+      <button data-view="safety">New Safety Incident</button>
+    </nav>
+  </header>
+
+  <main>
+    <section id="view-dashboard" class="view active">
+      <h2>Dashboard</h2>
+      <div id="health-status" class="card">Checking API…</div>
+      <div id="recent-runs" class="card-list"></div>
+    </section>
+
+    <section id="view-agents" class="view">
+      <h2>Agents</h2>
+      <div id="agents-list" class="card-list"></div>
+    </section>
+
+    <section id="view-hitl" class="view">
+      <h2>HITL — Safety Manager Review</h2>
+      <p class="hint">Review draft reports, approve or request changes. The graph resumes from the current checkpoint.</p>
+      <div id="hitl-tasks" class="card-list"></div>
+      <div id="hitl-detail" class="card hidden"></div>
+    </section>
+
+    <section id="view-tickets" class="view">
+      <h2>Failure Tickets</h2>
+      <p class="hint">Resolve tickets from the dashboard; workflow resumes without restarting.</p>
+      <div id="tickets-list" class="card-list"></div>
+    </section>
+
+    <section id="view-safety" class="view">
+      <h2>Start Safety Incident</h2>
+      <form id="safety-form" class="card">
+        <label>Flight number <input name="flight_number" value="BH202" required /></label>
+        <label>Incident type
+          <select name="incident_type">
+            <option>bird_strike</option>
+            <option>runway_incursion</option>
+            <option>system_failure</option>
+            <option>smoke_or_fire</option>
+            <option>medical_emergency</option>
+            <option>turbulence_injury</option>
+            <option>other</option>
+          </select>
+        </label>
+        <label>Severity
+          <select name="severity">
+            <option>low</option>
+            <option selected>medium</option>
+            <option>high</option>
+            <option>critical</option>
+          </select>
+        </label>
+        <label>Description <textarea name="description" rows="3"></textarea></label>
+        <label class="checkbox"><input type="checkbox" name="has_passenger_impact" /> Passenger impact</label>
+        <button type="submit">Start Safety Incident Agent</button>
+      </form>
+      <pre id="safety-result" class="card hidden"></pre>
+    </section>
+  </main>
+
+  <footer>
+    <span>Adel — Safety Incident Agent &amp; Full Platform</span>
+  </footer>
+  <script src="app.js"></script>
+</body>
+</html>
