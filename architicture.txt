@@ -1,241 +1,47 @@
-# Architecture — Blue Horizon IROPS Assistant
+# Final Architecture
 
-This document covers the full system as it stands after the Memory & RAG
-extension: the original MCP Server Lab layer (unchanged) plus the two new
-subsystems built on top of it.
+## System view
 
-## 1. System overview
-
-```
-                         ┌─────────────────────────────┐
-                         │   MCP Client (ops agent)     │
-                         │  client_stdio.py / client_http.py │
-                         └───────────────┬─────────────┘
-                                         │  MCP protocol
-                                         │  (stdio or Streamable HTTP)
-                         ┌───────────────▼─────────────┐
-                         │       server.py (FastMCP)     │
-                         │  tools · resources · prompts   │
-                         │  elicitation · sampling ·       │
-                         │  progress · notifications        │
-                         └───┬───────────┬───────────┬───┘
-                             │           │           │
-              ┌──────────────▼─┐   ┌────▼─────┐  ┌──▼───────────────┐
-              │ tools_read.py    │   │tools_write│  │ memory_tools.py    │
-              │ tools_write.py   │   │  .py      │  │ (the ONLY new file │
-              │ (existing tools, │   │           │  │  wiring memory+RAG │
-              │  + record_turn   │   │           │  │  into the server)  │
-              │  hooks added)    │   │           │  │                    │
-              └──────┬───────────┘   └────┬──────┘  └──┬──────────┬──────┘
-                     │                    │            │          │
-              ┌──────▼────────────────────▼───┐   ┌────▼───┐  ┌───▼────┐
-              │        dbase.py / MySQL          │   │ memory/│  │ rag/   │
-              │  passengers, flights, bookings,   │   │        │  │        │
-              │  crew, duty_time_logs,             │   │        │  │        │
-              │  compensation                       │   │        │  │        │
-              └─────────────────────────────────┘   └────────┘  └────────┘
+```mermaid
+flowchart LR
+    User[End user] --> UI[web_platform frontend]
+    Admin[Administrator] --> UI
+    UI --> API[Flask API]
+    API --> Graphs[State-graph agents]
+    Graphs --> Runner[StateGraphRunner]
+    Runner --> Store[(MySQL workflow runs + checkpoints)]
+    Graphs --> MCP[MCP read/write tools]
+    Graphs --> RAG[Existing RAG policy corpus]
+    Graphs --> Plan[Existing planning modules]
+    Runner --> HITL[(admin_tasks)]
+    Runner --> Tickets[(failure_tickets)]
+    Admin --> API
 ```
 
-Two things are true about this system at once: the original database and MCP
-server are the system of record for *live operational state* (what's booked,
-who's on duty, what's been paid), and the new memory/RAG layers are the system
-of record for *what's been learned and what's documented* (what happened last
-time, what the policy says). `memory_tools.py` is the only bridge between them.
+## Durable execution contract
 
-## 2. The existing layer (unchanged)
+`WorkflowState` is the single payload for a run: it records its ID, graph type, current node, status, workflow data, context, transition history, checkpoint number, waiting reason, administrator task, and last error. `create_run()` writes checkpoint 1. For each `NodeResult`, `StateGraphRunner` moves the state, records the reason, and calls `save_checkpoint()` before it can execute another node.
 
-- **`db/` (MySQL)** — `passengers`, `flights`, `bookings`, `crew`,
-  `crew_assignments`, `duty_time_logs`, `compensation`. Straight relational
-  schema, foreign keys enforced, no changes made for this lab.
-- **`mcp_server/tools_read.py`** — `get_flight_status`, `get_passenger_booking`.
-  Read-only, no authorization needed.
-- **`mcp_server/tools_write.py`** — `assign_reserve_crew`, `issue_compensation`,
-  `rebook_passenger`. Each does server-side validation, an in-handler
-  authorization check (`requested_by`/`issued_by` must look like a real ops
-  agent ID), and a safety check against real data before any INSERT/UPDATE.
-  The two duty-hour/compensation-cap tools use **elicitation**
-  (`elicitation_logic.py`) to pause and ask a human supervisor before
-  proceeding on a risky action.
-- **`mcp_server/progress_logic.py`** — `rebook_all_passengers_on_flight`, a
-  genuinely long-running batch tool reporting real progress via
-  `ctx.report_progress()`.
-- **`mcp_server/sampling_logic.py`** — `generate_disruption_notice`, which asks
-  the *connected client's* LLM to draft a passenger notice via
-  `ctx.session.create_message()` (MCP sampling), rather than the server calling
-  its own model.
-- **`mcp_server/notifications_logic.py`** — tracks supervisor authentication
-  state; `authenticate_supervisor` in `server.py` registers
-  `assign_reserve_crew`/`issue_compensation` at runtime and pushes a real
-  `notifications/tools/list_changed` event, rather than those tools existing
-  (and being guessable/callable) from session start.
-- **`mcp_server/tools_search.py`** — the original `search_knowledge_base`, four
-  hardcoded sentences with a BM25 keyword store. Left in place for comparison;
-  functionally superseded by `search_policy_manual` (below).
+The runner stops when the status is `waiting_external`, `waiting_admin`, `failed`, `completed`, or `cancelled`. `resume()` loads the saved state by run ID, adds the new event data, persists a resume checkpoint, then continues from the stored node. This is why a process restart cannot re-run already completed nodes.
 
-## 3. Memory layer (`memory/`)
+## Separation of pauses and failures
 
-```
- tool call happens
-        │
-        ▼
- ┌─────────────────┐   overflow?    ┌───────────────────────┐
- │ ShortTermMemory   ├───────────────▶│ PromoteOrDropRouter     │
- │ (short_term.py)    │                │ (router.py)              │
- │                     │                │ forget-vs-episodic only,  │
- │ rolling buffer      │                │ never writes semantic      │
- │ + scratchpad         │                └───────────┬───────────────┘
- │ (untouched by         │                            │ "episodic"
- │  pruning)               │                            ▼
- └─────────────────────────┘                ┌────────────────────┐
-                                             │ EpisodicStore         │
-                                             │ (episodic.py)           │
-                                             │ session-scoped,          │
-                                             │ persisted to JSON          │
-                                             └───────────┬────────────────┘
-                                                         │ read in bulk,
-                                                         │ periodically only
-                                                         ▼
-                                             ┌─────────────────────────┐
-                                             │ ConsolidationPass          │
-                                             │ (consolidation.py)           │
-                                             │ the ONLY writer to             │
-                                             │ SemanticStore                    │
-                                             └───────────┬───────────────────────┘
-                                                         ▼
-                                             ┌────────────────────────┐
-                                             │ SemanticStore              │
-                                             │ (semantic.py)                 │
-                                             │ versioned, conflict-aware,      │
-                                             │ authority-scored facts             │
-                                             └────────────────────────────────┘
-```
+| Concern | State | Durable record | Resume trigger |
+| --- | --- | --- | --- |
+| Expected human decision | `waiting_admin` | `admin_tasks` | Admin decision from the platform/API |
+| Expected outside response | `waiting_external` | `workflow_runs` + checkpoint | Customer, maintenance, crew, payment, or authority event |
+| Unexpected failure | `failed` | `failure_tickets` + workflow state | Ticket is resolved and the actual cause is corrected |
 
-**Key invariant:** there is exactly one path into semantic memory
-(`ConsolidationPass → SemanticStore.add_fact()`), and it runs as a separate,
-explicitly-triggered pass — never inline with the router, never at write time.
-The router's decision space stops at forget-vs-episodic.
+An expected HITL pause must not create a failure ticket. A ticket must identify the node and error and resume from that same stored node after the fix.
 
-**Session model:** one `ShortTermMemory` instance per `{flight_number}-{date}`
-(`memory_tools.get_session_id`). Episodic and semantic stores are shared/global
-since they're meant to persist and be queried across sessions.
+## Runtime controls
 
-## 4. RAG layer (`rag/`)
+`state_graph/tool_registry.py` stores per-agent tool permissions in `agent_tool_permissions` and checks them at execution time. The three graph packages call the existing MCP tools and RAG/planning components where those techniques are needed. See [docs/state-graphs.md](docs/state-graphs.md) for individual graph paths and [docs/api-contract.md](docs/api-contract.md) for API boundaries.
 
-```
- policy_corpus.py (18 sections, stable codes: IROPS-COMP-4.2b, etc.)
-        │
-        ▼
- embeddings.py ──(Gemini embeddings)──▶ vector_store.py (Chroma, HNSW index,
-                                          metadata payload + pre-filter)
-        │                                        │
-        │                                        │
-        ▼                                        ▼
- ┌──────────────┐   ┌───────────────────┐   ┌────────────────────────┐
- │ naive_rag.py   │   │ hybrid_rag.py       │   │ agentic_rag.py            │
- │ embed → top-k   │   │ vector + BM25         │   │ multi-hop function          │
- │ → generate       │   │ (hybrid_rag also       │   │ calling loop, decides         │
- │                   │   │ owns BM25PolicyIndex)   │   │ per-hop whether to               │
- │                   │   │                           │   │ retrieve again                     │
- └───────┬──────────┘   └──────────┬────────────┘   └─────────────┬───────────────┘
-         │                          │                              │
-         └──────────────┬───────────┴──────────────┬───────────────┘
-                        ▼                            ▼
-                ┌──────────────────────────────────────────┐
-                │ self_rag.py                                    │
-                │  check_relevance() + check_support()             │
-                │  verified_naive_rag_answer() /                    │
-                │  verified_hybrid_rag_answer() /                     │
-                │  verified_agentic_rag_answer()                        │
-                │  ALSO: verify_memory_recall() — same checks              │
-                │  applied to episodic/semantic recall                       │
-                └──────────────────────────────────────────────────────────┘
-```
+## Database ownership
 
-**Key invariant:** nothing reaches an ops agent from either RAG or memory
-recall without passing through `self_rag.py`'s relevance/support checks. A
-failed check produces an explicit refusal or "insufficient grounding" message,
-never a silent pass-through or a quiet rewrite.
-
-## 5. Integration layer (`mcp_server/memory_tools.py`)
-
-This is the only new file touching `mcp_server/`. It:
-
-1. Holds `_active_sessions: dict[str, ShortTermMemory]`, a shared
-   `PromoteOrDropRouter`, `EpisodicStore`, `SemanticStore`, `PolicyVectorStore`,
-   and `BM25PolicyIndex` — built once per server process.
-2. Exposes `record_turn()` and `update_scratchpad()`, called from inside the
-   existing `tools_read.py`/`tools_write.py` functions right before they
-   return — the original SQL and business logic is untouched; this is an added
-   side effect only.
-3. Exposes three new MCP tools:
-   - `recall_flight_history` — episodic recall, Self-RAG-verified, available
-     from session start (read-only).
-   - `search_policy_manual` — hybrid RAG over the full policy manual,
-     relevance-checked, available from session start (read-only).
-   - `run_memory_consolidation` — triggers `ConsolidationPass.run()` on
-     demand; registered only inside `authenticate_supervisor`, alongside
-     `assign_reserve_crew`/`issue_compensation`, because it changes what the
-     whole system treats as current truth going forward.
-
-## 6. Data flow — one disruption end to end
-
-```
-1. Ops agent calls get_flight_status("BH202")
-   → tools_read.py queries MySQL, returns status
-   → record_turn() logs the result into ShortTermMemory("BH202-2026-08-02")
-   → if status is disrupted/delayed/cancelled: update_scratchpad() sets
-     current_flight, current_goal, working_facts.disruption_reason
-
-2. Agent calls search_policy_manual("compensation for mechanical disruption")
-   → hybrid_search() over vector_store.py + BM25PolicyIndex
-   → check_relevance() filters candidates
-   → returns only verified-relevant policy sections
-
-3. Agent calls assign_reserve_crew(...) → duty-hour limit exceeded
-   → update_scratchpad() records the pending decision
-   → request_supervisor_approval() (elicitation) pauses for a human
-   → once resolved: resolve_pending_decision(), record_turn() logs the outcome
-
-4. Session's ShortTermMemory overflows during a long disruption
-   → PromoteOrDropRouter drains it: routine checks forgotten,
-     the disruption reason + supervisor override promoted to EpisodicStore
-
-5. (Separately, periodically) supervisor calls run_memory_consolidation()
-   → ConsolidationPass reads new episodes, extracts facts, resolves any
-     conflicts (e.g. an earlier "mechanical" report vs. a later confirmed
-     "weather" report), writes the winning version to SemanticStore
-
-6. Tomorrow: a different ops agent opens a new BH202 session and calls
-   recall_flight_history("BH202", "any duty-hour overrides on record?")
-   → pulls the promoted episode from step 4, Self-RAG-verified for relevance
-   → the front-desk re-explaining problem this project was built to fix
-     is now actually fixed
-```
-
-## 7. Evaluation harnesses (not part of the live server)
-
-- **`context_eval/`** exercises `strategies.py`'s four pruning strategies
-  against synthetic long transcripts (`test_suite.py`), using
-  `memory/router.py`'s `SIGNAL_WEIGHTS` for its significance-based masking —
-  the same underlying "is this worth keeping" judgment reused at the context
-  layer instead of the episodic-promotion layer.
-- **`retrieval_eval/`** exercises all three RAG architectures (through their
-  Self-RAG-*verified* entry points) against `test_questions.py`'s 12
-  domain questions.
-
-Both produce a comparison table and a justified default choice, documented in
-`README.md` with the actual numbers from real runs.
-
-## 8. External dependencies by layer
-
-| Layer | Depends on |
-|---|---|
-| `db/`, `tools_read.py`, `tools_write.py` | `mysql-connector-python` |
-| `mcp_server/` (protocol) | `mcp` |
-| `memory/` | standard library only (`json`, `re`, `dataclasses`) |
-| `context_eval/` | `google-genai` (real Gemini calls for summarization/answering) |
-| `rag/` | `google-genai` (embeddings + generation), `chromadb`, `rank_bm25` |
-| `retrieval_eval/` | same as `rag/` |
-| all `.env`-reading modules | `python-dotenv` |
-
-See `requirements.txt` for pinned versions.
+- `workflow_runs` contains the latest durable state for every workflow.
+- `workflow_checkpoints` is the immutable transition history.
+- `admin_tasks` stores expected approval/review requests.
+- `failure_tickets` stores unplanned failures and their resolution metadata.
+- Domain tables retain workflow-specific business data: maintenance cases, compensation appeals/revisions, and safety incidents/submissions.
