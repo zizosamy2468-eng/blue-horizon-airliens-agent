@@ -44,7 +44,10 @@ from state_graph.maintenance.graph import (  # noqa: E402
     resume_maintenance_release,
     start_maintenance_release,
 )
-
+from state_graph.compensation.graph import (
+    resume_compensation_appeal,
+    start_compensation_appeal,
+)
 
 def _workflow_summary(state) -> str:
     """Return a readable workflow result for MCP clients and the platform."""
@@ -126,6 +129,62 @@ def resume_maintenance_release_workflow(
 
     return _workflow_summary(state)
 
+def start_compensation_appeal_workflow(
+    flight_number: str,
+    passenger_email: str,
+    appeal_reason: str,
+    requested_amount: float,
+    currency: str = "USD",
+    requested_by: str = "agent_014",
+    loyalty_tier: str = "unknown",
+) -> str:
+    """
+    Start the Compensation Appeal workflow for one passenger/flight.
+    """
+    state = start_compensation_appeal(
+        flight_number=flight_number,
+        passenger_email=passenger_email,
+        appeal_reason=appeal_reason,
+        requested_amount=requested_amount,
+        currency=currency,
+        requested_by=requested_by,
+        loyalty_tier=loyalty_tier,
+    )
+    return _workflow_summary(state)
+
+
+def resume_compensation_appeal_workflow(
+    run_id: str,
+    customer_documents: dict | None = None,
+    admin_decision: str | None = None,
+    admin_decided_by: str | None = None,
+    payment_result: str | None = None,
+) -> str:
+    """
+    Resume a saved Compensation Appeal workflow.
+    """
+    from state_graph.external_events import (
+        inject_admin_decision,
+        inject_customer_documents,
+        inject_payment_result,
+    )
+
+    if customer_documents is not None:
+        state = inject_customer_documents(run_id, customer_documents)
+    elif admin_decision is not None:
+        state = inject_admin_decision(
+            run_id=run_id,
+            decision=admin_decision,
+            decided_by=admin_decided_by or "ops_manager_001",
+        )
+    elif payment_result is not None:
+        state = inject_payment_result(run_id, payment_result)
+    else:
+        raise ValueError(
+            "Provide customer_documents, admin_decision, or payment_result."
+        )
+
+    return _workflow_summary(state)
 
 # =========================================================
 # MCP SERVER
@@ -153,7 +212,8 @@ mcp.tool()(resolve_disruption)
 # Final Project: persistent State Graph Agent tools.
 mcp.tool()(start_maintenance_release_workflow)
 mcp.tool()(resume_maintenance_release_workflow)
-
+mcp.tool()(start_compensation_appeal_workflow)
+mcp.tool()(resume_compensation_appeal_workflow)
 
 # =========================================================
 # TOOL: authenticate_supervisor
