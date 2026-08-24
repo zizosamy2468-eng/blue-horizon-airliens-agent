@@ -1,15 +1,3 @@
-# tools_read.py
-# All READ-ONLY tools live here. These tools never change state in the database,
-# so they don't need authorization checks or elicitation -- they're safe by nature.
-#
-# This file only defines plain functions. The actual @mcp.tool() registration happens
-# in server.py, so this file has no dependency on the FastMCP instance itself.
-# MEMORY INTEGRATION (added for the Memory & RAG lab): each function now
-# calls record_turn() right before it returns, so the result becomes part
-# of that flight's short-term memory buffer for the current IROPS session.
-# Nothing about the original SQL or return format changed -- this is
-# purely an added side effect.
-
 
 from dbase import get_connection
 from memory_tools import get_session_id, record_turn, update_scratchpad
@@ -112,3 +100,53 @@ def get_passenger_booking(passenger_email: str) -> str:
         )
 
     return "\n".join(lines)
+
+def get_flight_status_record(flight_number: str) -> dict | None:
+    """
+    Return a structured flight-status record for state-graph workflows.
+
+    Unlike get_flight_status(), this returns a Python dictionary instead
+    of a human-readable string, so graph nodes do not need to parse text.
+    """
+    conn = get_connection()
+    cursor = conn.cursor(dictionary=True)
+
+    try:
+        cursor.execute(
+            """
+            SELECT
+                flight_number,
+                origin_airport,
+                destination_airport,
+                scheduled_departure,
+                scheduled_arrival,
+                status,
+                disruption_reason
+            FROM flights
+            WHERE flight_number = %s
+            """,
+            (flight_number,),
+        )
+
+        result = cursor.fetchone()
+
+        if result is None:
+            return None
+
+        # Datetime values must be converted to strings because the workflow
+        # state will later be stored as JSON in MySQL.
+        if result["scheduled_departure"] is not None:
+            result["scheduled_departure"] = (
+                result["scheduled_departure"].isoformat()
+            )
+
+        if result["scheduled_arrival"] is not None:
+            result["scheduled_arrival"] = (
+                result["scheduled_arrival"].isoformat()
+            )
+
+        return result
+
+    finally:
+        cursor.close()
+        conn.close()
